@@ -2,7 +2,7 @@
 
 # termite-circus
 
-Benchmark suite for [termite](https://github.com/antflydb/termite) (our local ML inference engine) vs llama.cpp.
+Benchmark suite for [termite](https://github.com/antflydb/termite) (Antfly's local ML inference engine) vs llama.cpp.
 
 ## Quick start
 
@@ -31,8 +31,7 @@ That directory is gitignored. When it exists, `make bench` builds and benchmarks
 The intended use is to have an agent run the benchmark and post results to Zulip:
 
 ```
-Run `make bench` in ~/rowan/termite-circus and post results/gemma4-e4b.md
-to #eval-runs > termite-gemma-4
+Run `make bench` and post results/gemma4-e4b.md to #eval-runs > termite-gemma-4
 ```
 
 For benchmarking code changes, ask the agent to make changes in `termite-zig-experimentation/` first, then run the benchmark. The output will include both the clean baseline and the experimental build so the diff is obvious.
