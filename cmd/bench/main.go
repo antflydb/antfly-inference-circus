@@ -118,11 +118,11 @@ func main() {
 		})
 	}
 
-	// termite-go — server-based, skipped for now if binary doesn't support generate
+	// termite-go — ONNX-only generator; cannot benchmark GGUF models
 	if *goBin != "" {
 		configs = append(configs, benchConfig{
 			Name: "termite-go", Cmd: *goBin,
-			Args:   nil, // handled specially
+			Args:   nil,
 			Commit: gitHash(*goDir),
 		})
 	}
@@ -137,10 +137,9 @@ func main() {
 
 		var r benchResult
 		if cfg.Name == "termite-go" {
-			// termite-go is a server — note that it doesn't support CLI generate
 			r = benchResult{
 				Config: cfg,
-				Error:  "termite-go is server-only; CLI generate not supported (server bench TODO)",
+				Error:  "termite-go only supports ONNX generators; GGUF benchmark requires termite-zig",
 			}
 		} else {
 			r = runBench(cfg)
