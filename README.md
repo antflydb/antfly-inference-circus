@@ -35,3 +35,30 @@ Run `make bench` and post results/gemma4-e4b.md to #eval-runs > termite-gemma-4
 ```
 
 For benchmarking code changes, ask the agent to make changes in `termite-zig-experimentation/` first, then run the benchmark. The output will include both the clean baseline and the experimental build so the diff is obvious.
+
+## Nightly automated benchmark
+
+A launchd job runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds termite-zig at both the latest tagged release and tip of main, benchmarks both against llama.cpp, and posts results to `#eval-runs > termite-circus-nightly` on Zulip.
+
+The job is defined at:
+```
+~/Library/LaunchAgents/com.termite-circus.nightly-bench.plist
+```
+
+Manage it with:
+```bash
+# Check status
+launchctl list | grep termite
+
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.termite-circus.nightly-bench.plist
+
+# Start
+launchctl load -w ~/Library/LaunchAgents/com.termite-circus.nightly-bench.plist
+
+# View logs
+tail -f ~/.termite-circus-nightly.log
+
+# Manual run (without Zulip post)
+./scripts/nightly-bench.sh
+```
