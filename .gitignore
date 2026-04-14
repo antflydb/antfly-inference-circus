@@ -7,3 +7,6 @@
 
 # Experimentation repo (local only, not tracked)
 /termite-zig-experimentation/
+
+# Nightly build artifacts
+/.nightly/
