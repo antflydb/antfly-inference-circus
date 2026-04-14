@@ -3,9 +3,9 @@ MODELS_DIR  := $(HOME)/.termite/models/generators
 LLAMA_CLI   ?= llama-cli
 
 # Termite builds
+TERMITE_DIR         := $(CURDIR)/termite
 TERMITE_ZIG_CLEAN   := $(CURDIR)/termite-zig-clean
 TERMITE_ZIG_EXP     := $(CURDIR)/termite-zig-experimentation
-TERMITE_GO_DIR      := $(CURDIR)/termite-go
 ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Donnx=false -Dpjrt=false -Dcoreml=false
 
 # Benchmark settings
@@ -40,23 +40,23 @@ build-zig-exp: ## Build termite-zig-experimentation
 	cd $(TERMITE_ZIG_EXP) && zig build $(ZIG_BUILD_FLAGS) \
 		-Dgit-commit="$$(git rev-parse --short HEAD)"
 
-build-go: ## Build termite-go
-	cd $(TERMITE_GO_DIR) && GOEXPERIMENT=simd go build -o bin/termite ./pkg/termite/cmd
+build-termite: ## Build termite (main repo)
+	cd $(TERMITE_DIR) && GOEXPERIMENT=simd go build -o bin/termite ./pkg/termite/cmd
 
-build: build-zig-clean build-go ## Build clean zig + go
+build: build-zig-clean build-termite ## Build clean zig + termite
 
 build-all: build build-zig-exp ## Build all three
 
 # ─── Benchmarks ──────────────────────────────────────────────────
 
-bench: build ## Benchmark: llama.cpp + termite-zig-clean + termite-go
+bench: build ## Benchmark: llama.cpp + termite-zig-clean + termite
 	go run ./cmd/bench \
 		-model "$(GEMMA4_E4B_PATH)" \
 		-model-dir "$(MODELS_DIR)/$(GEMMA4_E4B_REPO)" \
 		-zig-clean "$(TERMITE_ZIG_CLEAN)/zig-out/bin/termite" \
 		-zig-clean-dir "$(TERMITE_ZIG_CLEAN)" \
-		-go-bin "$(TERMITE_GO_DIR)/bin/termite" \
-		-go-dir "$(TERMITE_GO_DIR)" \
+		-termite "$(TERMITE_DIR)/bin/termite" \
+		-termite-dir "$(TERMITE_DIR)" \
 		-llama-cli "$(LLAMA_CLI)" \
 		-prompt "$(BENCH_PROMPT)" \
 		-n $(BENCH_TOKENS) \
@@ -72,8 +72,8 @@ bench-all: build-all ## Benchmark: llama.cpp + all three termite engines
 		-zig-clean-dir "$(TERMITE_ZIG_CLEAN)" \
 		-zig-exp "$(TERMITE_ZIG_EXP)/zig-out/bin/termite" \
 		-zig-exp-dir "$(TERMITE_ZIG_EXP)" \
-		-go-bin "$(TERMITE_GO_DIR)/bin/termite" \
-		-go-dir "$(TERMITE_GO_DIR)" \
+		-termite "$(TERMITE_DIR)/bin/termite" \
+		-termite-dir "$(TERMITE_DIR)" \
 		-llama-cli "$(LLAMA_CLI)" \
 		-prompt "$(BENCH_PROMPT)" \
 		-n $(BENCH_TOKENS) \

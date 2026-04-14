@@ -25,8 +25,8 @@ var (
 	zigCleanDir = flag.String("zig-clean-dir", "", "Path to termite-zig-clean repo (for git hash)")
 	zigExpBin   = flag.String("zig-exp", "", "Path to termite-zig-experimentation binary")
 	zigExpDir   = flag.String("zig-exp-dir", "", "Path to termite-zig-experimentation repo")
-	goBin       = flag.String("go-bin", "", "Path to termite-go binary")
-	goDir       = flag.String("go-dir", "", "Path to termite-go repo (for git hash)")
+	termiteBin  = flag.String("termite", "", "Path to termite (main repo) binary")
+	termiteDir  = flag.String("termite-dir", "", "Path to termite repo (for git hash)")
 
 	prompt    = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
 	maxTokens = flag.Int("n", 32, "Max tokens to generate")
@@ -51,6 +51,12 @@ type benchResult struct {
 	TokensGen int
 	RawOutput string
 	Error     string
+}
+
+// hasGenerate probes whether a termite binary supports the `generate` CLI subcommand.
+func hasGenerate(bin string) bool {
+	err := exec.Command(bin, "generate", "--help").Run()
+	return err == nil
 }
 
 func gitHash(dir string) string {
@@ -118,13 +124,20 @@ func main() {
 		})
 	}
 
-	// termite-go — ONNX-only generator; cannot benchmark GGUF models
-	if *goBin != "" {
-		configs = append(configs, benchConfig{
-			Name: "termite-go", Cmd: *goBin,
-			Args:   nil,
-			Commit: gitHash(*goDir),
-		})
+	// termite (main repo) — probe for `generate` subcommand support
+	if *termiteBin != "" {
+		if hasGenerate(*termiteBin) {
+			configs = append(configs, benchConfig{
+				Name: "termite", Cmd: *termiteBin,
+				Args: termiteArgs(*termiteBin), Commit: gitHash(*termiteDir),
+			})
+		} else {
+			configs = append(configs, benchConfig{
+				Name: "termite", Cmd: *termiteBin,
+				Args:   nil,
+				Commit: gitHash(*termiteDir),
+			})
+		}
 	}
 
 	var results []benchResult
@@ -136,10 +149,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, " ...")
 
 		var r benchResult
-		if cfg.Name == "termite-go" {
+		if cfg.Args == nil {
 			r = benchResult{
 				Config: cfg,
-				Error:  "termite-go only supports ONNX generators; GGUF benchmark requires termite-zig",
+				Error:  "no `generate` subcommand; GGUF benchmark not supported by this build",
 			}
 		} else {
 			r = runBench(cfg)
