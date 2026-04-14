@@ -4,3 +4,6 @@
 
 # Benchmark results (regenerated on each run)
 /results/
+
+# Experimentation repo (local only, not tracked)
+/termite-zig-experimentation/

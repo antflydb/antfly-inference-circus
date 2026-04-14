@@ -1,9 +1,6 @@
 [submodule "termite-zig-clean"]
 	path = termite-zig-clean
 	url = https://github.com/antflydb/termite-zig
-[submodule "termite-zig-experimentation"]
-	path = termite-zig-experimentation
-	url = https://github.com/antflydb/termite-zig
 [submodule "termite"]
 	path = termite
 	url = https://github.com/antflydb/termite

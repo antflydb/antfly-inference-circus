@@ -53,6 +53,11 @@ type benchResult struct {
 	Error     string
 }
 
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // hasGenerate probes whether a termite binary supports the `generate` CLI subcommand.
 func hasGenerate(bin string) bool {
 	err := exec.Command(bin, "generate", "--help").Run()
@@ -116,8 +121,8 @@ func main() {
 		})
 	}
 
-	// termite-zig-experimentation (optional)
-	if *zigExpBin != "" {
+	// termite-zig-experimentation (optional — silently skip if not present)
+	if *zigExpBin != "" && fileExists(*zigExpBin) {
 		configs = append(configs, benchConfig{
 			Name: "termite-zig (exp)", Cmd: *zigExpBin,
 			Args: termiteArgs(*zigExpBin), Commit: gitHash(*zigExpDir),
