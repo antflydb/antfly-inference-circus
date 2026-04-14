@@ -1,0 +1,6 @@
+# Go build artifacts
+/bin/
+*.exe
+
+# Benchmark results (regenerated on each run)
+/results/
