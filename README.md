@@ -38,7 +38,22 @@ For benchmarking code changes, ask the agent to make changes in `termite-zig-exp
 
 ## Nightly automated benchmark
 
-A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds termite-zig at both the latest tagged release and tip of main, benchmarks both against llama.cpp, and posts results to `#eval-runs > termite-circus-nightly` on Zulip.
+A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds `antfly-zig/pkg/termite` twice: once from a manually pinned stable Antfly commit, and once from `origin/main`. It benchmarks both against llama.cpp using seven nightly bug prompts and posts the report to `#eval-runs > termite-circus-nightly` on Zulip.
+
+The default pinned stable Antfly commit is:
+```bash
+8caea6fc21abc4b8a96dd43a1cc7c49ae9faf188
+```
+
+To manually change the stable version for future runs, set `ANTFLY_STABLE_COMMIT` in `.env`:
+```bash
+ANTFLY_STABLE_COMMIT=<commit-sha>
+```
+
+You can verify the chosen stable commit locally with:
+```bash
+git -C antfly-zig show --no-patch --stat "$ANTFLY_STABLE_COMMIT"
+```
 
 The tracked plist template lives at:
 ```bash
@@ -69,8 +84,12 @@ tail -f ~/.termite-circus-nightly.log
 
 # Manual run (without Zulip post)
 ./scripts/nightly-bench.sh
+
+# One-off run at a specific local time
+sudo ./scripts/schedule-launchdaemon-once.sh YYYY-MM-DD HH:MM
 ```
 
 Notes:
 - `LaunchDaemon` is the right choice when you want to install and manage the job entirely from a background shell with `sudo`.
 - If the machine is asleep at 2:05 AM, the run is still missed. Add a scheduled wake with `pmset repeat` if that matters.
+- The nightly runner leaves `antfly-zig` checked out at `origin/main` after the build.

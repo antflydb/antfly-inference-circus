@@ -28,23 +28,38 @@ var (
 	termiteBin  = flag.String("termite", "", "Path to termite (main repo) binary")
 	termiteDir  = flag.String("termite-dir", "", "Path to termite repo (for git hash)")
 
-	prompt    = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
-	maxTokens = flag.Int("n", 32, "Max tokens to generate")
-	output    = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
+	prompt     = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
+	promptFile = flag.String("prompt-file", "", "Path to newline-delimited prompts")
+	maxTokens  = flag.Int("n", 32, "Max tokens to generate")
+	output     = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
 )
 
+const promptPlaceholder = "__BENCH_PROMPT__"
+
 type benchConfig struct {
-	Name    string
-	Cmd     string
-	Args    []string
-	UsePTY  bool
-	Commit  string // short git hash (for clean repos)
+	Name   string
+	Cmd    string
+	Args   []string
+	UsePTY bool
+	Commit string // short git hash (for clean repos)
 }
 
 type benchResult struct {
 	Config    benchConfig
+	Prompt    string
 	GenTPS    float64
 	PromptTPS float64
+	PrefillMs float64
+	PeakRSSMB float64
+	WallSec   float64
+	TokensGen int
+	RawOutput string
+	Error     string
+}
+
+type benchSummary struct {
+	Config    benchConfig
+	GenTPS    float64
 	PrefillMs float64
 	PeakRSSMB float64
 	WallSec   float64
@@ -75,24 +90,113 @@ func gitHash(dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
+func loadPrompts() ([]string, error) {
+	if *promptFile == "" {
+		return []string{*prompt}, nil
+	}
+	raw, err := os.ReadFile(*promptFile)
+	if err != nil {
+		return nil, err
+	}
+	var prompts []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			prompts = append(prompts, line)
+		}
+	}
+	if len(prompts) == 0 {
+		return nil, fmt.Errorf("no prompts found in %s", *promptFile)
+	}
+	return prompts, nil
+}
+
+func argsForPrompt(args []string, prompt string) []string {
+	resolved := make([]string, len(args))
+	for i, arg := range args {
+		if arg == promptPlaceholder {
+			resolved[i] = prompt
+			continue
+		}
+		resolved[i] = arg
+	}
+	return resolved
+}
+
+func summarizeRuns(cfg benchConfig, runs []benchResult) benchSummary {
+	summary := benchSummary{Config: cfg}
+	if len(runs) == 0 {
+		summary.Error = "no benchmark runs"
+		return summary
+	}
+
+	var genSum, prefillSum, peakSum, wallSum float64
+	var successCount int
+	var raw strings.Builder
+
+	for _, run := range runs {
+		raw.WriteString("## Prompt: ")
+		raw.WriteString(run.Prompt)
+		raw.WriteString("\n")
+		if run.Error != "" {
+			raw.WriteString("ERROR: ")
+			raw.WriteString(run.Error)
+			raw.WriteString("\n")
+		}
+		if run.RawOutput != "" {
+			raw.WriteString(strings.TrimSpace(run.RawOutput))
+			raw.WriteString("\n")
+		}
+		raw.WriteString("\n")
+
+		if run.Error != "" {
+			continue
+		}
+		successCount++
+		genSum += run.GenTPS
+		prefillSum += run.PrefillMs
+		peakSum += run.PeakRSSMB
+		wallSum += run.WallSec
+		summary.TokensGen += run.TokensGen
+	}
+
+	summary.RawOutput = strings.TrimSpace(raw.String())
+	if successCount == 0 {
+		summary.Error = "all prompt runs failed"
+		return summary
+	}
+
+	summary.GenTPS = genSum / float64(successCount)
+	summary.PrefillMs = prefillSum / float64(successCount)
+	summary.PeakRSSMB = peakSum / float64(successCount)
+	summary.WallSec = wallSum / float64(successCount)
+	summary.TokensGen /= successCount
+	return summary
+}
+
 func main() {
 	flag.Parse()
 	if *modelGGUF == "" || *modelDir == "" {
 		fmt.Fprintln(os.Stderr, "usage: bench -model <gguf> -model-dir <dir> [engine flags]")
 		os.Exit(1)
 	}
+	prompts, err := loadPrompts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error loading prompts: %v\n", err)
+		os.Exit(1)
+	}
 
 	n := strconv.Itoa(*maxTokens)
 
 	llamaBase := []string{
-		"-m", *modelGGUF, "-p", *prompt, "-n", n,
+		"-m", *modelGGUF, "-p", promptPlaceholder, "-n", n,
 		"--temp", "0", "--no-display-prompt", "--perf",
 		"--single-turn", "--reasoning-format", "none",
 	}
 
 	termiteArgs := func(bin string) []string {
 		return []string{
-			"generate", *modelDir, *prompt,
+			"generate", *modelDir, promptPlaceholder,
 			"--backend", "mlx", "--max-tokens", n,
 			"--temperature", "0",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
@@ -145,34 +249,43 @@ func main() {
 		}
 	}
 
-	var results []benchResult
+	var results []benchSummary
 	for _, cfg := range configs {
-		fmt.Fprintf(os.Stderr, "running: %s", cfg.Name)
-		if cfg.Commit != "" {
-			fmt.Fprintf(os.Stderr, " (%s)", cfg.Commit)
-		}
-		fmt.Fprintln(os.Stderr, " ...")
-
-		var r benchResult
-		if cfg.Args == nil {
-			r = benchResult{
-				Config: cfg,
-				Error:  "no `generate` subcommand; GGUF benchmark not supported by this build",
+		var runs []benchResult
+		for idx, benchPrompt := range prompts {
+			fmt.Fprintf(os.Stderr, "running: %s", cfg.Name)
+			if cfg.Commit != "" {
+				fmt.Fprintf(os.Stderr, " (%s)", cfg.Commit)
 			}
-		} else {
-			r = runBench(cfg)
-		}
+			fmt.Fprintf(os.Stderr, " [prompt %d/%d] ...\n", idx+1, len(prompts))
 
-		if r.Error != "" {
-			fmt.Fprintf(os.Stderr, "  ERROR: %s\n", r.Error)
-		} else {
-			fmt.Fprintf(os.Stderr, "  gen: %.1f tok/s | prefill: %.0fms | RSS: %.0f MB | wall: %.1fs\n",
-				r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec)
+			var r benchResult
+			if cfg.Args == nil {
+				r = benchResult{
+					Config: cfg,
+					Prompt: benchPrompt,
+					Error:  "no `generate` subcommand; GGUF benchmark not supported by this build",
+				}
+			} else {
+				promptCfg := cfg
+				promptCfg.Args = argsForPrompt(cfg.Args, benchPrompt)
+				r = runBench(promptCfg)
+				r.Config = cfg
+				r.Prompt = benchPrompt
+			}
+
+			if r.Error != "" {
+				fmt.Fprintf(os.Stderr, "  ERROR: %s\n", r.Error)
+			} else {
+				fmt.Fprintf(os.Stderr, "  gen: %.1f tok/s | prefill: %.0fms | RSS: %.0f MB | wall: %.1fs\n",
+					r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec)
+			}
+			runs = append(runs, r)
 		}
-		results = append(results, r)
+		results = append(results, summarizeRuns(cfg, runs))
 	}
 
-	if err := writeMarkdown(results); err != nil {
+	if err := writeMarkdown(results, prompts); err != nil {
 		fmt.Fprintf(os.Stderr, "error writing output: %v\n", err)
 		os.Exit(1)
 	}
@@ -341,7 +454,7 @@ func maxTreeRSS(pid int) int64 {
 
 // ─── Markdown output ─────────────────────────────────────────────
 
-func writeMarkdown(results []benchResult) error {
+func writeMarkdown(results []benchSummary, prompts []string) error {
 	var b strings.Builder
 
 	modelName := filepath.Base(filepath.Dir(*modelGGUF)) + "/" + filepath.Base(*modelGGUF)
@@ -351,8 +464,19 @@ func writeMarkdown(results []benchResult) error {
 	b.WriteString(fmt.Sprintf("**Date:** %s  \n", time.Now().Format("2006-01-02 15:04")))
 	b.WriteString(fmt.Sprintf("**Host:** %s (%s)  \n", hostname, archString()))
 	b.WriteString(fmt.Sprintf("**Model:** `%s`  \n", modelName))
-	b.WriteString(fmt.Sprintf("**Prompt:** %q  \n", *prompt))
+	if len(prompts) == 1 {
+		b.WriteString(fmt.Sprintf("**Prompt:** %q  \n", prompts[0]))
+	} else {
+		b.WriteString(fmt.Sprintf("**Prompts:** %d nightly bug questions  \n", len(prompts)))
+	}
 	b.WriteString(fmt.Sprintf("**Max tokens:** %d  \n\n", *maxTokens))
+
+	if len(prompts) > 1 {
+		for i, benchPrompt := range prompts {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, benchPrompt))
+		}
+		b.WriteString("\n")
+	}
 
 	// Engine versions
 	b.WriteString("**Versions:**\n")
