@@ -8,5 +8,8 @@
 # Experimentation repo (local only, not tracked)
 /termite-zig-experimentation/
 
+# Credentials (never commit)
+.env
+
 # Nightly build artifacts
 /.nightly/

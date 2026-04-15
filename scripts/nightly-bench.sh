@@ -14,9 +14,13 @@ set -euo pipefail
 CIRCUS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ZIG_DIR="$CIRCUS_DIR/termite-zig-clean"
 RESULTS="$CIRCUS_DIR/results/nightly.md"
-ZULIP_CLI="$HOME/rowan/.claude/skills/zulip-messenger/zulip-cli"
-ZULIP_RC="$HOME/zuliprc_antfly_claude_rowan"
 ZIG_BUILD_FLAGS="-Doptimize=ReleaseFast -Donnx=false -Dpjrt=false -Dcoreml=false"
+
+# Load credentials from .env if present
+if [ -f "$CIRCUS_DIR/.env" ]; then
+    # shellcheck disable=SC1091
+    source "$CIRCUS_DIR/.env"
+fi
 
 TAG_BIN="$CIRCUS_DIR/.nightly/tag/termite"
 MAIN_BIN="$CIRCUS_DIR/.nightly/main/termite"
@@ -91,11 +95,17 @@ cat "$RESULTS"
 
 # ─── Post to Zulip ───────────────────────────────────────────────
 if [[ "${1:-}" == "--post-zulip" ]]; then
-    if [ -x "$ZULIP_CLI" ] && [ -f "$ZULIP_RC" ]; then
+    if [ -n "${ZULIP_BOT:-}" ] && [ -n "${ZULIP_KEY:-}" ] && [ -n "${ZULIP_SITE:-}" ]; then
         log "posting to Zulip..."
-        "$ZULIP_CLI" --zuliprc "$ZULIP_RC" post eval-runs "termite-circus-nightly" --file "$RESULTS"
+        curl -sf -u "$ZULIP_BOT:$ZULIP_KEY" \
+            "$ZULIP_SITE/api/v1/messages" \
+            --data-urlencode type=stream \
+            --data-urlencode to=eval-runs \
+            --data-urlencode topic=termite-circus-nightly \
+            --data-urlencode "content@$RESULTS" \
+            > /dev/null
         log "posted."
     else
-        log "warning: zulip-cli or zuliprc not found, skipping post"
+        log "warning: ZULIP_BOT/ZULIP_KEY/ZULIP_SITE not set (see .env.example), skipping post"
     fi
 fi
