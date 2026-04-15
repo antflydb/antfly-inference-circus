@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.termite-circus.nightly-bench</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/stinkbug/rowan/termite-circus/scripts/nightly-bench.sh</string>
+		<string>--post-zulip</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/stinkbug/rowan/termite-circus</string>
+
+	<key>UserName</key>
+	<string>stinkbug</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/stinkbug</string>
+		<key>GH_CONFIG_DIR</key>
+		<string>/Users/stinkbug/rowan/.config/gh</string>
+		<key>HOMEBREW_CELLAR</key>
+		<string>/Users/stinkbug/.homebrew/Cellar</string>
+		<key>HOMEBREW_PREFIX</key>
+		<string>/Users/stinkbug/.homebrew</string>
+		<key>HOMEBREW_REPOSITORY</key>
+		<string>/Users/stinkbug/.homebrew</string>
+		<key>PATH</key>
+		<string>/Users/stinkbug/.cargo/bin:/Users/stinkbug/.opencode/bin:/Users/stinkbug/.homebrew/bin:/Users/stinkbug/.homebrew/sbin:/Users/stinkbug/.local/bin:/Users/stinkbug/rowan/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/stinkbug/.local/share/zinit/polaris/bin</string>
+	</dict>
+
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>2</integer>
+		<key>Minute</key>
+		<integer>5</integer>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>/Users/stinkbug/.termite-circus-nightly.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/stinkbug/.termite-circus-nightly.log</string>
+</dict>
+</plist>

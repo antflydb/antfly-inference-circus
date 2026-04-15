@@ -38,23 +38,31 @@ For benchmarking code changes, ask the agent to make changes in `termite-zig-exp
 
 ## Nightly automated benchmark
 
-A launchd job runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds termite-zig at both the latest tagged release and tip of main, benchmarks both against llama.cpp, and posts results to `#eval-runs > termite-circus-nightly` on Zulip.
+A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds termite-zig at both the latest tagged release and tip of main, benchmarks both against llama.cpp, and posts results to `#eval-runs > termite-circus-nightly` on Zulip.
 
-The job is defined at:
+The tracked plist template lives at:
+```bash
+launchd/com.termite-circus.nightly-bench.plist
 ```
-~/Library/LaunchAgents/com.termite-circus.nightly-bench.plist
+
+Install or refresh it with:
+```bash
+sudo ./scripts/install-launchdaemon.sh
 ```
 
 Manage it with:
 ```bash
 # Check status
-launchctl list | grep termite
+sudo launchctl print system/com.termite-circus.nightly-bench
 
 # Stop
-launchctl unload ~/Library/LaunchAgents/com.termite-circus.nightly-bench.plist
+sudo launchctl bootout system /Library/LaunchDaemons/com.termite-circus.nightly-bench.plist
 
 # Start
-launchctl load -w ~/Library/LaunchAgents/com.termite-circus.nightly-bench.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.termite-circus.nightly-bench.plist
+
+# Trigger immediately for a smoke test
+sudo launchctl kickstart -k system/com.termite-circus.nightly-bench
 
 # View logs
 tail -f ~/.termite-circus-nightly.log
@@ -62,3 +70,7 @@ tail -f ~/.termite-circus-nightly.log
 # Manual run (without Zulip post)
 ./scripts/nightly-bench.sh
 ```
+
+Notes:
+- `LaunchDaemon` is the right choice when you want to install and manage the job entirely from a background shell with `sudo`.
+- If the machine is asleep at 2:05 AM, the run is still missed. Add a scheduled wake with `pmset repeat` if that matters.
