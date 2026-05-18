@@ -49,7 +49,7 @@ func main() {
 			humanBytes(info.Size()), humanBytes(remoteSize))
 	}
 
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	if err := ensureDir(destDir); err != nil {
 		fmt.Fprintf(os.Stderr, "error creating directory: %v\n", err)
 		os.Exit(1)
 	}
@@ -58,6 +58,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func ensureDir(path string) error {
+	if info, err := os.Stat(path); err == nil {
+		if info.IsDir() {
+			return nil
+		}
+		return fmt.Errorf("%s exists and is not a directory", path)
+	}
+
+	if linkInfo, err := os.Lstat(path); err == nil && linkInfo.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+
+	return os.MkdirAll(path, 0o755)
 }
 
 func headSize(url string) (int64, error) {
