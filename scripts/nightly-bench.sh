@@ -19,6 +19,10 @@ ANTFLY_STABLE_COMMIT="${ANTFLY_STABLE_COMMIT:-8caea6fc21abc4b8a96dd43a1cc7c49ae9
 TERMITE_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dshared-lib-root=../.. -Dskip-openapi=true"
 MODEL_REPO="${MODEL_REPO:-ggml-org/gemma-4-E4B-it-GGUF}"
 MODEL_FILE="${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
+POST_ZULIP=false
+if [[ "${1:-}" == "--post-zulip" ]]; then
+    POST_ZULIP=true
+fi
 
 # Load credentials from .env if present
 if [ -f "$CIRCUS_DIR/.env" ]; then
@@ -38,8 +42,54 @@ ANTFLY_MAIN_BIN="$ANTFLY_MAIN_DIR/termite"
 PROMPT_FILE="$CIRCUS_DIR/.nightly/prompts.txt"
 MODEL_DIR="$HOME/.termite/models/generators/$MODEL_REPO"
 MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
+LOG_PATH="${LOG_PATH:-$HOME/.termite-circus-nightly.log}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
+
+post_zulip_file() {
+    local file="$1"
+    if [ -n "${ZULIP_BOT:-}" ] && [ -n "${ZULIP_KEY:-}" ] && [ -n "${ZULIP_SITE:-}" ]; then
+        curl -sf -u "$ZULIP_BOT:$ZULIP_KEY" \
+            "$ZULIP_SITE/api/v1/messages" \
+            --data-urlencode type=stream \
+            --data-urlencode to=eval-runs \
+            --data-urlencode topic=termite-circus-nightly \
+            --data-urlencode "content@$file" \
+            > /dev/null
+    else
+        return 1
+    fi
+}
+
+notify_failure() {
+    local status=$?
+    local msg
+    trap - ERR
+    log "ERROR: nightly failed with status $status"
+
+    if $POST_ZULIP; then
+        msg="$(mktemp)"
+        {
+            echo "# Termite nightly benchmark failed"
+            echo
+            echo "**Date:** $(date '+%Y-%m-%d %H:%M')"
+            echo "**Host:** $(hostname)"
+            echo "**Exit status:** $status"
+            echo
+            echo '```spoiler recent log'
+            tail -80 "$LOG_PATH" 2>/dev/null || true
+            echo '```'
+        } >"$msg"
+        if post_zulip_file "$msg"; then
+            log "posted failure notice."
+        else
+            log "warning: failed to post failure notice"
+        fi
+        rm -f "$msg"
+    fi
+
+    exit "$status"
+}
 
 fetch_antfly_zig() {
     # Match the interactive shell's GitHub auth path, but refuse prompts so the
@@ -168,7 +218,12 @@ termite_build_flags_for_current_ref() {
 }
 
 termite_build_flags_without_mlx() {
-    printf '%s' "$TERMITE_BUILD_FLAGS_BASE"
+    local flags="$TERMITE_BUILD_FLAGS_BASE"
+    local build_zig="$ANTFLY_DIR/pkg/termite/build.zig"
+    if grep -q '"mlx"' "$build_zig"; then
+        flags="$flags -Dmlx=false"
+    fi
+    printf '%s' "$flags"
 }
 
 build_termite() {
@@ -237,6 +292,8 @@ build_antfly_main_termite() {
         return 1
     fi
 }
+
+trap notify_failure ERR
 
 # ─── Fetch latest code ───────────────────────────────────────────
 log "fetching antfly-zig..."
@@ -308,18 +365,11 @@ log "results written to $RESULTS"
 git -C "$ANTFLY_DIR" checkout --quiet origin/main
 
 # ─── Post to Zulip ───────────────────────────────────────────────
-if [[ "${1:-}" == "--post-zulip" ]]; then
-    if [ -n "${ZULIP_BOT:-}" ] && [ -n "${ZULIP_KEY:-}" ] && [ -n "${ZULIP_SITE:-}" ]; then
-        log "posting to Zulip..."
-        curl -sf -u "$ZULIP_BOT:$ZULIP_KEY" \
-            "$ZULIP_SITE/api/v1/messages" \
-            --data-urlencode type=stream \
-            --data-urlencode to=eval-runs \
-            --data-urlencode topic=termite-circus-nightly \
-            --data-urlencode "content@$RESULTS" \
-            > /dev/null
+if $POST_ZULIP; then
+    log "posting to Zulip..."
+    if post_zulip_file "$RESULTS"; then
         log "posted."
     else
-        log "warning: ZULIP_BOT/ZULIP_KEY/ZULIP_SITE not set (see .env.example), skipping post"
+        log "warning: Zulip credentials missing or post failed; skipping post"
     fi
 fi
