@@ -28,7 +28,13 @@ done
 
 if [[ ! -f "$TARGET_PLIST" ]]; then
     echo "missing installed plist: $TARGET_PLIST" >&2
+    echo "run sudo ./scripts/install-launchdaemon.sh first" >&2
     exit 1
+fi
+
+# Unload, patch to one-shot time, reload
+if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "system/$LABEL" 2>/dev/null || true
 fi
 
 /usr/libexec/PlistBuddy -c "Delete :StartCalendarInterval" "$TARGET_PLIST" 2>/dev/null || true
@@ -39,9 +45,10 @@ fi
 /usr/libexec/PlistBuddy -c "Add :StartCalendarInterval:Hour integer $HOUR" "$TARGET_PLIST"
 /usr/libexec/PlistBuddy -c "Add :StartCalendarInterval:Minute integer $MINUTE" "$TARGET_PLIST"
 
-launchctl bootout system "$TARGET_PLIST" >/dev/null 2>&1 || true
+xattr -c "$TARGET_PLIST"
 launchctl bootstrap system "$TARGET_PLIST"
-launchctl print "system/$LABEL"
+launchctl enable "system/$LABEL"
 
-echo
 echo "scheduled one-shot run for $DATE_ARG $TIME_ARG"
+echo "NOTE: re-run sudo ./scripts/install-launchdaemon.sh afterwards to restore the nightly 2:05 AM schedule"
+launchctl print "system/$LABEL" 2>&1 | head -5

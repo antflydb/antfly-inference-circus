@@ -30,16 +30,36 @@
 		<key>HOMEBREW_REPOSITORY</key>
 		<string>/Users/stinkbug/.homebrew</string>
 		<key>PATH</key>
-		<string>/Users/stinkbug/.cargo/bin:/Users/stinkbug/.opencode/bin:/Users/stinkbug/.homebrew/bin:/Users/stinkbug/.homebrew/sbin:/Users/stinkbug/.local/bin:/Users/stinkbug/rowan/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/stinkbug/.local/share/zinit/polaris/bin</string>
+		<string>/Users/stinkbug/.cargo/bin:/Users/stinkbug/.opencode/bin:/Users/stinkbug/.homebrew/bin:/Users/stinkbug/.homebrew/sbin:/Users/stinkbug/.local/bin:/Users/stinkbug/rowan/.local/bin:/Users/stinkbug/.local/share/zigup/0.16.0/files:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/stinkbug/.local/share/zinit/polaris/bin</string>
 	</dict>
 
 	<key>StartCalendarInterval</key>
-	<dict>
-		<key>Hour</key>
-		<integer>2</integer>
-		<key>Minute</key>
-		<integer>5</integer>
-	</dict>
+	<array>
+		<dict>
+			<key>Weekday</key>
+			<integer>1</integer>
+			<key>Hour</key>
+			<integer>2</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key>
+			<integer>3</integer>
+			<key>Hour</key>
+			<integer>2</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Weekday</key>
+			<integer>5</integer>
+			<key>Hour</key>
+			<integer>2</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+	</array>
 
 	<key>StandardOutPath</key>
 	<string>/Users/stinkbug/.termite-circus-nightly.log</string>
