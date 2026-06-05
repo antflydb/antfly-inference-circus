@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # Nightly termite benchmark: antfly-zig/pkg/termite stable vs latest, plus public Antfly repo Termite
 # Intended to run non-interactively from launchd/cron.
@@ -99,7 +99,7 @@ fetch_antfly_zig() {
         -c credential.interactive=never \
         -c 'credential.https://github.com.helper=!/opt/homebrew/bin/gh auth git-credential' \
         -C "$ANTFLY_DIR" \
-        fetch --tags --quiet origin
+        fetch --force --tags --quiet origin
 }
 
 git_fetch() {
@@ -109,7 +109,7 @@ git_fetch() {
         -c credential.interactive=never \
         -c 'credential.https://github.com.helper=!/opt/homebrew/bin/gh auth git-credential' \
         -C "$dir" \
-        fetch --tags --quiet origin
+        fetch --force --tags --quiet origin
 }
 
 ensure_antfly_main_repo() {
@@ -263,25 +263,49 @@ build_termite() {
     cp "$ANTFLY_DIR/pkg/termite/zig-out/bin/termite" "$out_bin"
 }
 
+antfly_main_termite_layout() {
+    local src_dir="${1:-$ANTFLY_MAIN_SRC_DIR}"
+
+    if [ -f "$src_dir/go/pkg/termite/go.mod" ] && [ -d "$src_dir/go/pkg/termite/cmd" ]; then
+        printf '%s\t%s\t%s\n' "$src_dir/go/pkg/termite" ". ./cmd/..." "$src_dir/go/pkg/termite"
+        return 0
+    fi
+
+    if [ -d "$src_dir/lib/termite" ] && [ -d "$src_dir/pkg/termite/cmd" ]; then
+        printf '%s\t%s\t%s\n' "$src_dir" "./lib/termite" "$src_dir/pkg/termite"
+        return 0
+    fi
+
+    log "ERROR: unable to find public Antfly Termite layout under $src_dir"
+    return 1
+}
+
 build_antfly_main_termite() {
     local sha="$1"
     local out_dir="$2"
     local out_bin="$out_dir/termite"
     local build_log="$out_dir/build.log"
+    local test_dir
+    local test_pkgs
+    local build_dir
+    local test_args
 
     mkdir -p "$out_dir"
     git -C "$ANTFLY_MAIN_SRC_DIR" checkout --quiet --force origin/main
-    log "go testing Antfly main lib/termite ($sha)..."
+    IFS=$'\t' read -r test_dir test_pkgs build_dir < <(antfly_main_termite_layout "$ANTFLY_MAIN_SRC_DIR")
+    read -r -a test_args <<< "$test_pkgs"
+
+    log "go testing Antfly main Termite module ($sha)..."
     if ! run_with_timeout 600 bash -c \
-        "cd '$ANTFLY_MAIN_SRC_DIR' && GOEXPERIMENT=simd go test ./lib/termite >'$build_log' 2>&1"; then
-        log "ERROR: go test failed for Antfly main lib/termite ($sha); tail of $build_log:"
+        "cd '$test_dir' && GOEXPERIMENT=simd go test ${test_args[*]} >'$build_log' 2>&1"; then
+        log "ERROR: go test failed for Antfly main Termite module ($sha); tail of $build_log:"
         tail -80 "$build_log" >&2 || true
         return 1
     fi
 
     log "building Termite (public antfly repo) CLI ($sha)..."
     if ! run_with_timeout 1800 bash -c \
-        "cd '$ANTFLY_MAIN_SRC_DIR/pkg/termite' && GOEXPERIMENT=simd go build -o '$out_bin' ./cmd >>'$build_log' 2>&1"; then
+        "cd '$build_dir' && GOEXPERIMENT=simd go build -o '$out_bin' ./cmd >>'$build_log' 2>&1"; then
         log "ERROR: go build failed for Termite (public antfly repo) CLI ($sha); tail of $build_log:"
         tail -80 "$build_log" >&2 || true
         return 1
@@ -293,6 +317,10 @@ build_antfly_main_termite() {
     fi
 }
 
+if [[ "${NIGHTLY_BENCH_LIB_ONLY:-false}" == "true" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 trap notify_failure ERR
 
 # ─── Fetch latest code ───────────────────────────────────────────
@@ -302,7 +330,9 @@ if ! fetch_antfly_zig; then
 fi
 
 log "fetching Antfly main..."
-ensure_antfly_main_repo
+if ! ensure_antfly_main_repo; then
+    log "warning: Antfly main fetch failed; continuing with cached origin refs/tags"
+fi
 
 ensure_model
 
