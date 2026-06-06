@@ -16,16 +16,21 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-install -o root -g wheel -m 0644 "$SOURCE_PLIST" "$TARGET_PLIST"
-
+# Unload if already loaded
 if launchctl print "system/$LABEL" >/dev/null 2>&1; then
-    launchctl bootout system "$TARGET_PLIST" >/dev/null 2>&1 || true
+    echo "unloading existing job..."
+    launchctl bootout "system/$LABEL" 2>/dev/null || true
 fi
+
+install -o root -g wheel -m 0644 "$SOURCE_PLIST" "$TARGET_PLIST"
+# macOS may add provenance/quarantine xattrs (e.g. if written by a sandboxed
+# process) which silently prevent launchctl from loading the plist.
+xattr -c "$TARGET_PLIST"
 
 launchctl bootstrap system "$TARGET_PLIST"
 launchctl enable "system/$LABEL"
-launchctl print "system/$LABEL"
 
-echo
-echo "installed: $TARGET_PLIST"
-echo "logs: /Users/stinkbug/.termite-circus-nightly.log"
+echo "installed and loaded: $LABEL"
+echo "next run: 2:00 AM Monday/Wednesday/Friday"
+echo "logs: ~/.termite-circus-nightly.log"
+launchctl print "system/$LABEL" 2>&1 | head -5

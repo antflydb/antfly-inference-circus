@@ -27,6 +27,7 @@ var (
 	zigExpDir   = flag.String("zig-exp-dir", "", "Path to termite-zig-experimentation repo")
 	termiteBin  = flag.String("termite", "", "Path to termite (main repo) binary")
 	termiteDir  = flag.String("termite-dir", "", "Path to termite repo (for git hash)")
+	termiteName = flag.String("termite-name", "termite", "Display name for termite (main repo) binary")
 
 	prompt     = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
 	promptFile = flag.String("prompt-file", "", "Path to newline-delimited prompts")
@@ -180,6 +181,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: bench -model <gguf> -model-dir <dir> [engine flags]")
 		os.Exit(1)
 	}
+	if !fileExists(*modelGGUF) {
+		fmt.Fprintf(os.Stderr, "model GGUF not found: %s\n", *modelGGUF)
+		os.Exit(1)
+	}
+	if info, err := os.Stat(*modelDir); err != nil || !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "model directory not found: %s\n", *modelDir)
+		os.Exit(1)
+	}
 	prompts, err := loadPrompts()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error loading prompts: %v\n", err)
@@ -198,6 +207,7 @@ func main() {
 		return []string{
 			"generate", *modelDir, promptPlaceholder,
 			"--backend", "mlx", "--max-tokens", n,
+			"--backend-budget-mb", "20480",
 			"--temperature", "0",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
 		}
@@ -237,12 +247,12 @@ func main() {
 	if *termiteBin != "" {
 		if hasGenerate(*termiteBin) {
 			configs = append(configs, benchConfig{
-				Name: "termite", Cmd: *termiteBin,
+				Name: *termiteName, Cmd: *termiteBin,
 				Args: termiteArgs(*termiteBin), Commit: gitHash(*termiteDir),
 			})
 		} else {
 			configs = append(configs, benchConfig{
-				Name: "termite", Cmd: *termiteBin,
+				Name: *termiteName, Cmd: *termiteBin,
 				Args:   nil,
 				Commit: gitHash(*termiteDir),
 			})
@@ -264,7 +274,7 @@ func main() {
 				r = benchResult{
 					Config: cfg,
 					Prompt: benchPrompt,
-					Error:  "no `generate` subcommand; GGUF benchmark not supported by this build",
+					Error:  "no termite-zig-compatible `generate` subcommand; GGUF benchmark not supported by this build",
 				}
 			} else {
 				promptCfg := cfg
@@ -329,11 +339,17 @@ func runBench(cfg benchConfig) benchResult {
 	raw = strings.ReplaceAll(raw, "^D", "")
 
 	if err != nil {
-		return benchResult{
+		r := benchResult{
 			Config: cfg, RawOutput: raw,
 			Error:   fmt.Sprintf("exit: %v", err),
 			WallSec: wall.Seconds(), PeakRSSMB: float64(peakRSSKB) / 1024,
 		}
+		if !strings.Contains(cfg.Name, "llama") && termiteRunCompleted(raw) {
+			r.Error = ""
+			r.TokensGen = *maxTokens
+			parseTermite(&r)
+		}
+		return r
 	}
 
 	r := benchResult{
@@ -356,10 +372,17 @@ func runBench(cfg benchConfig) benchResult {
 
 var (
 	reTermiteTiming = regexp.MustCompile(`generate_timing_ms:.*?prefill=(\d+).*?decode=(\d+).*?total=(\d+)`)
+	reTermiteTotal  = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
 	reTermiteTokens = regexp.MustCompile(`tokens=(\d+)`)
 	reLlamaPerf     = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
 	reANSI          = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 )
+
+func termiteRunCompleted(raw string) bool {
+	return reTermiteTiming.MatchString(raw) &&
+		reTermiteTokens.MatchString(raw) &&
+		strings.Contains(raw, "finish_reason=")
+}
 
 func parseTermite(r *benchResult) {
 	if m := reTermiteTiming.FindStringSubmatch(r.RawOutput); m != nil {
@@ -371,6 +394,12 @@ func parseTermite(r *benchResult) {
 		}
 		if decode > 0 && r.TokensGen > 0 {
 			r.GenTPS = float64(r.TokensGen) / (decode / 1000)
+		}
+	}
+	if m := reTermiteTotal.FindStringSubmatch(r.RawOutput); m != nil {
+		total, _ := strconv.ParseFloat(m[1], 64)
+		if total > 0 {
+			r.WallSec = total / 1000
 		}
 	}
 }

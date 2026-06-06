@@ -33,6 +33,10 @@ help: ## Show this help
 download-gemma4-e4b: ## Download Gemma 4 E4B Q4_K_M GGUF (~5 GB)
 	go run ./cmd/model-dl -repo $(GEMMA4_E4B_REPO) -file $(GEMMA4_E4B_FILE)
 
+test: ## Run repo tests
+	go test ./cmd/...
+	./scripts/nightly-bench-test.sh
+
 # ─── Builds ──────────────────────────────────────────────────────
 
 build-zig-clean: ## Build termite-zig-clean

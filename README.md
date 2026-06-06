@@ -38,7 +38,7 @@ For benchmarking code changes, ask the agent to make changes in `termite-zig-exp
 
 ## Nightly automated benchmark
 
-A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds `antfly-zig/pkg/termite` twice: once from a manually pinned stable Antfly commit, and once from `origin/main`. It benchmarks both against llama.cpp using seven nightly bug prompts and posts the report to `#eval-runs > termite-circus-nightly` on Zulip.
+A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds `antfly-zig/pkg/termite` twice: once from a manually pinned stable Antfly commit, and once from `origin/main`. It also fetches Antfly main into `.nightly/antfly-main-src`, runs `go test ./lib/termite`, and builds the Go termite CLI from `pkg/termite/cmd`. The runner verifies the configured GGUF model is present and downloads it if needed before benchmarking. The report benchmarks the buildable termite variants against llama.cpp using the nightly bug prompt and posts to `#eval-runs > termite-circus-nightly` on Zulip; `Termite (public antfly repo)` is listed even while its current CLI lacks the termite-zig `generate` command used by this GGUF benchmark.
 
 The default pinned stable Antfly commit is:
 ```bash
@@ -93,3 +93,6 @@ Notes:
 - `LaunchDaemon` is the right choice when you want to install and manage the job entirely from a background shell with `sudo`.
 - If the machine is asleep at 2:05 AM, the run is still missed. Add a scheduled wake with `pmset repeat` if that matters.
 - The nightly runner leaves `antfly-zig` checked out at `origin/main` after the build.
+- Override `ANTFLY_MAIN_REPO_URL` or `ANTFLY_MAIN_SRC_DIR` in `.env` to test a different Antfly main checkout.
+- Override `MODEL_REPO` or `MODEL_FILE` in `.env` to use a different GGUF benchmark model.
+- Override `MLX_ROOT` in `.env` if `libmlxc.dylib` is not under `$HOMEBREW_PREFIX` or `~/.homebrew`.
