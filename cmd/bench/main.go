@@ -74,23 +74,32 @@ func fileExists(path string) bool {
 }
 
 // generateSubcommand returns the subcommand chain that gets to `generate` for
-// the given antfly binary. It tries `inference generate` (latest antfly), then
-// `termite generate` (transitional), then bare `generate` (legacy termite-zig).
-// Returns nil if no shape works.
+// the given antfly binary. It checks each candidate parent's --help output for
+// `generate` listed as a subcommand. Exit codes are unreliable: the new
+// antfly's CLI prints help-on-error for invalid args, and cobra binaries
+// return 0 on unknown subcommands with --help in flight. Content matching is.
+//
+// Tries `inference` (latest antfly), `termite` (transitional brew antfly),
+// then bare (legacy termite-zig).
 func generateSubcommand(bin string) []string {
 	candidates := [][]string{
-		{"inference", "generate"},
-		{"termite", "generate"},
-		{"generate"},
+		{"inference"},
+		{"termite"},
+		nil,
 	}
-	for _, prefix := range candidates {
-		probe := append(append([]string{}, prefix...), "--help")
-		if err := exec.Command(bin, probe...).Run(); err == nil {
-			return prefix
+	for _, parent := range candidates {
+		help := append(append([]string{}, parent...), "--help")
+		out, _ := exec.Command(bin, help...).CombinedOutput()
+		if reGenerateSubcmd.Match(out) {
+			return append(append([]string{}, parent...), "generate")
 		}
 	}
 	return nil
 }
+
+// reGenerateSubcmd matches a line listing `generate` as a subcommand — e.g.
+// "  generate    Run text generation" (cobra) or "  generate" (zig CLI).
+var reGenerateSubcmd = regexp.MustCompile(`(?m)^\s+generate(\s|$)`)
 
 func gitHash(dir string) string {
 	if dir == "" {
