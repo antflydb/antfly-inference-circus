@@ -7,7 +7,7 @@ ANTFLY_SRC          ?= $(CURDIR)/antfly
 ANTFLY_ZIG_DIR      := $(ANTFLY_SRC)/zig
 ANTFLY_LATEST_BIN   := $(ANTFLY_ZIG_DIR)/zig-out/bin/antfly
 ANTFLY_STABLE_BIN   ?= $(shell command -v antfly 2>/dev/null)
-ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dskip-openapi=true
+ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dedition=full
 
 # Benchmark settings
 BENCH_PROMPT  ?= Explain what a compiler does in two sentences.
@@ -42,7 +42,7 @@ test: ## Run repo tests
 build-antfly-latest: ## Build antfly from antfly/zig with the latest zig
 ifneq ($(HAS_ANTFLY_SRC),)
 	cd $(ANTFLY_ZIG_DIR) && zig build $(ZIG_BUILD_FLAGS) \
-		-Dgit-commit="$$(git -C $(ANTFLY_SRC) rev-parse --short HEAD)"
+		-Dantfly-version="$$(git -C $(ANTFLY_SRC) rev-parse --short HEAD)"
 else
 	@echo "antfly source not found at $(ANTFLY_SRC); clone it first or set ANTFLY_SRC=/path/to/antfly"
 	@exit 1

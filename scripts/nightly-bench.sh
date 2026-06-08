@@ -12,7 +12,7 @@ set -Eeuo pipefail
 CIRCUS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ANTFLY_REPO_URL="${ANTFLY_REPO_URL:-https://github.com/antflydb/antfly}"
 RESULTS="$CIRCUS_DIR/results/nightly.md"
-TERMITE_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dskip-openapi=true"
+TERMITE_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dedition=full"
 MODEL_REPO="${MODEL_REPO:-ggml-org/gemma-4-E4B-it-GGUF}"
 MODEL_FILE="${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
 POST_ZULIP=false
@@ -260,12 +260,12 @@ build_latest_antfly() {
     build_flags="$(termite_build_flags_for_build_dir "$build_dir")"
     log "using $zig_cmd for antfly origin/main ($sha) in $build_dir"
     if ! run_with_timeout 1800 bash -c \
-        "cd '$build_dir' && $zig_cmd build $build_flags -Dgit-commit='$sha' >'$build_log' 2>&1"; then
+        "cd '$build_dir' && $zig_cmd build $build_flags -Dantfly-version='$sha' >'$build_log' 2>&1"; then
         if [[ "$build_flags" == *"-Dmlx=true"* ]]; then
             log "warning: MLX build failed for antfly main ($sha); retrying without MLX"
             build_flags="$(termite_build_flags_without_mlx "$build_dir")"
             if ! run_with_timeout 1800 bash -c \
-                "cd '$build_dir' && $zig_cmd build $build_flags -Dgit-commit='$sha' >'$build_log' 2>&1"; then
+                "cd '$build_dir' && $zig_cmd build $build_flags -Dantfly-version='$sha' >'$build_log' 2>&1"; then
                 log "ERROR: build timed out or failed for antfly main ($sha); tail of $build_log:"
                 tail -80 "$build_log" >&2 || true
                 return 1
