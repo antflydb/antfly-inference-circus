@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Nightly termite benchmark: antfly-zig/pkg/termite stable vs latest, plus public Antfly repo Termite
+# Nightly termite benchmark: brew-installed antfly (stable) vs antfly built
+# from antfly main with the latest zig (latest, runnable as `antfly inference`).
 # Intended to run non-interactively from launchd/cron.
 #
 # Usage:
 #   ./scripts/nightly-bench.sh                  # run + print results
 #   ./scripts/nightly-bench.sh --post-zulip     # run + post to Zulip
-#
-# Cron example (2:05 AM Pacific nightly):
-#   5 2 * * * cd ~/rowan/termite-circus && ./scripts/nightly-bench.sh --post-zulip 2>&1 >> ~/.termite-circus-nightly.log
 
 CIRCUS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ANTFLY_DIR="$CIRCUS_DIR/antfly-zig"
-ANTFLY_MAIN_REPO_URL="${ANTFLY_MAIN_REPO_URL:-https://github.com/antflydb/antfly}"
+ANTFLY_REPO_URL="${ANTFLY_REPO_URL:-https://github.com/antflydb/antfly}"
 RESULTS="$CIRCUS_DIR/results/nightly.md"
-ANTFLY_STABLE_COMMIT="${ANTFLY_STABLE_COMMIT:-8caea6fc21abc4b8a96dd43a1cc7c49ae9faf188}"
-TERMITE_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dshared-lib-root=../.. -Dskip-openapi=true"
+TERMITE_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dskip-openapi=true"
 MODEL_REPO="${MODEL_REPO:-ggml-org/gemma-4-E4B-it-GGUF}"
 MODEL_FILE="${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
 POST_ZULIP=false
@@ -32,17 +28,25 @@ fi
 
 MLX_ROOT="${MLX_ROOT:-${HOMEBREW_PREFIX:-$HOME/.homebrew}}"
 
-STABLE_DIR="$CIRCUS_DIR/.nightly/stable"
+# Source layout. Prefer a pre-existing checkout at $CIRCUS_DIR/antfly (which
+# is .gitignored), fall back to cloning into .nightly/antfly-src on demand.
+DEFAULT_LOCAL_ANTFLY="$CIRCUS_DIR/antfly"
+if [ -z "${ANTFLY_SRC_DIR:-}" ]; then
+    if [ -d "$DEFAULT_LOCAL_ANTFLY/.git" ]; then
+        ANTFLY_SRC_DIR="$DEFAULT_LOCAL_ANTFLY"
+    else
+        ANTFLY_SRC_DIR="$CIRCUS_DIR/.nightly/antfly-src"
+    fi
+fi
+
 LATEST_DIR="$CIRCUS_DIR/.nightly/latest"
-ANTFLY_MAIN_SRC_DIR="${ANTFLY_MAIN_SRC_DIR:-$CIRCUS_DIR/.nightly/antfly-main-src}"
-ANTFLY_MAIN_DIR="$CIRCUS_DIR/.nightly/antfly-main"
-STABLE_BIN="$STABLE_DIR/termite"
-LATEST_BIN="$LATEST_DIR/termite"
-ANTFLY_MAIN_BIN="$ANTFLY_MAIN_DIR/termite"
+LATEST_BIN="$LATEST_DIR/antfly"
 PROMPT_FILE="$CIRCUS_DIR/.nightly/prompts.txt"
 MODEL_DIR="$HOME/.termite/models/generators/$MODEL_REPO"
 MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
 LOG_PATH="${LOG_PATH:-$HOME/.termite-circus-nightly.log}"
+
+STABLE_BIN="${ANTFLY_STABLE_BIN:-$(command -v antfly || true)}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
 
@@ -91,17 +95,6 @@ notify_failure() {
     exit "$status"
 }
 
-fetch_antfly_zig() {
-    # Match the interactive shell's GitHub auth path, but refuse prompts so the
-    # daemon fails fast if the token/config is unavailable.
-    GIT_TERMINAL_PROMPT=0 git \
-        -c core.askPass= \
-        -c credential.interactive=never \
-        -c 'credential.https://github.com.helper=!/opt/homebrew/bin/gh auth git-credential' \
-        -C "$ANTFLY_DIR" \
-        fetch --force --tags --quiet origin
-}
-
 git_fetch() {
     local dir="$1"
     GIT_TERMINAL_PROMPT=0 git \
@@ -112,19 +105,22 @@ git_fetch() {
         fetch --force --tags --quiet origin
 }
 
-ensure_antfly_main_repo() {
-    if [ -d "$ANTFLY_MAIN_SRC_DIR/.git" ]; then
-        git_fetch "$ANTFLY_MAIN_SRC_DIR"
+ensure_antfly_repo() {
+    if [ -d "$ANTFLY_SRC_DIR/.git" ]; then
+        if ! git_fetch "$ANTFLY_SRC_DIR"; then
+            log "warning: fetch failed for $ANTFLY_SRC_DIR; continuing with cached refs/tags"
+        fi
         return
     fi
 
-    rm -rf "$ANTFLY_MAIN_SRC_DIR"
-    mkdir -p "$(dirname "$ANTFLY_MAIN_SRC_DIR")"
+    rm -rf "$ANTFLY_SRC_DIR"
+    mkdir -p "$(dirname "$ANTFLY_SRC_DIR")"
+    log "cloning antfly into $ANTFLY_SRC_DIR..."
     GIT_TERMINAL_PROMPT=0 git \
         -c core.askPass= \
         -c credential.interactive=never \
         -c 'credential.https://github.com.helper=!/opt/homebrew/bin/gh auth git-credential' \
-        clone --quiet "$ANTFLY_MAIN_REPO_URL" "$ANTFLY_MAIN_SRC_DIR"
+        clone --quiet "$ANTFLY_REPO_URL" "$ANTFLY_SRC_DIR"
 }
 
 ensure_model() {
@@ -195,9 +191,29 @@ kill_tree() {
     kill "$pid" 2>/dev/null || true
 }
 
-zig_for_current_ref() {
-    local version
-    version="$(sed -n 's/.*minimum_zig_version = "\([^"]*\)".*/\1/p' "$ANTFLY_DIR/pkg/termite/build.zig.zon" | head -1)"
+# antfly main keeps its zig sources under `zig/`. Earlier layouts used
+# `pkg/termite` as the build root; tolerate both.
+antfly_zig_build_dir() {
+    local src_dir="${1:-$ANTFLY_SRC_DIR}"
+    if [ -f "$src_dir/zig/build.zig" ]; then
+        printf '%s\n' "$src_dir/zig"
+        return 0
+    fi
+    if [ -f "$src_dir/pkg/termite/build.zig" ]; then
+        printf '%s\n' "$src_dir/pkg/termite"
+        return 0
+    fi
+    log "ERROR: unable to find a zig build root under $src_dir"
+    return 1
+}
+
+zig_for_build_dir() {
+    local build_dir="$1"
+    local zon="$build_dir/build.zig.zon"
+    local version=""
+    if [ -f "$zon" ]; then
+        version="$(sed -n 's/.*minimum_zig_version = "\([^"]*\)".*/\1/p' "$zon" | head -1)"
+    fi
     if [ -n "$version" ] && command -v zigup >/dev/null 2>&1; then
         printf 'zigup run %s' "$version"
     else
@@ -205,12 +221,13 @@ zig_for_current_ref() {
     fi
 }
 
-termite_build_flags_for_current_ref() {
+termite_build_flags_for_build_dir() {
+    local build_dir="$1"
     local flags="$TERMITE_BUILD_FLAGS_BASE"
-    local build_zig="$ANTFLY_DIR/pkg/termite/build.zig"
-    if [ -f "$MLX_ROOT/lib/libmlxc.dylib" ] && grep -q '"mlx"' "$build_zig"; then
+    local build_zig="$build_dir/build.zig"
+    if [ -f "$MLX_ROOT/lib/libmlxc.dylib" ] && grep -q '"mlx"' "$build_zig" 2>/dev/null; then
         flags="$flags -Dmlx=true"
-        if grep -q '"mlx-root"' "$build_zig"; then
+        if grep -q '"mlx-root"' "$build_zig" 2>/dev/null; then
             flags="$flags -Dmlx-root=$MLX_ROOT"
         fi
     fi
@@ -218,103 +235,53 @@ termite_build_flags_for_current_ref() {
 }
 
 termite_build_flags_without_mlx() {
+    local build_dir="$1"
     local flags="$TERMITE_BUILD_FLAGS_BASE"
-    local build_zig="$ANTFLY_DIR/pkg/termite/build.zig"
-    if grep -q '"mlx"' "$build_zig"; then
+    local build_zig="$build_dir/build.zig"
+    if grep -q '"mlx"' "$build_zig" 2>/dev/null; then
         flags="$flags -Dmlx=false"
     fi
     printf '%s' "$flags"
 }
 
-build_termite() {
-    local ref="$1"
-    local sha="$2"
-    local out_dir="$3"
-    local out_bin="$out_dir/termite"
+build_latest_antfly() {
+    local sha="$1"
+    local out_dir="$2"
+    local out_bin="$out_dir/antfly"
     local build_log="$out_dir/build.log"
+    local build_dir
     local zig_cmd
     local build_flags
 
-    git -C "$ANTFLY_DIR" checkout --quiet "$ref"
+    git -C "$ANTFLY_SRC_DIR" checkout --quiet --force origin/main
+    build_dir="$(antfly_zig_build_dir "$ANTFLY_SRC_DIR")"
     mkdir -p "$out_dir"
-    zig_cmd="$(zig_for_current_ref)"
-    build_flags="$(termite_build_flags_for_current_ref)"
-    log "using $zig_cmd for $ref ($sha)"
+    zig_cmd="$(zig_for_build_dir "$build_dir")"
+    build_flags="$(termite_build_flags_for_build_dir "$build_dir")"
+    log "using $zig_cmd for antfly origin/main ($sha) in $build_dir"
     if ! run_with_timeout 1800 bash -c \
-        "cd '$ANTFLY_DIR/pkg/termite' && $zig_cmd build $build_flags -Dgit-commit='$sha' >'$build_log' 2>&1"; then
+        "cd '$build_dir' && $zig_cmd build $build_flags -Dgit-commit='$sha' >'$build_log' 2>&1"; then
         if [[ "$build_flags" == *"-Dmlx=true"* ]]; then
-            log "warning: MLX build failed for $ref ($sha); retrying without MLX"
-            build_flags="$(termite_build_flags_without_mlx)"
-            if run_with_timeout 1800 bash -c \
-                "cd '$ANTFLY_DIR/pkg/termite' && $zig_cmd build $build_flags -Dgit-commit='$sha' >'$build_log' 2>&1"; then
-                cp "$ANTFLY_DIR/pkg/termite/zig-out/bin/termite" "$out_bin"
-                return 0
+            log "warning: MLX build failed for antfly main ($sha); retrying without MLX"
+            build_flags="$(termite_build_flags_without_mlx "$build_dir")"
+            if ! run_with_timeout 1800 bash -c \
+                "cd '$build_dir' && $zig_cmd build $build_flags -Dgit-commit='$sha' >'$build_log' 2>&1"; then
+                log "ERROR: build timed out or failed for antfly main ($sha); tail of $build_log:"
+                tail -80 "$build_log" >&2 || true
+                return 1
             fi
+        else
+            log "ERROR: build timed out or failed for antfly main ($sha); tail of $build_log:"
+            tail -80 "$build_log" >&2 || true
+            return 1
         fi
-        log "ERROR: build timed out or failed for $ref ($sha); tail of $build_log:"
+    fi
+    if [ ! -x "$build_dir/zig-out/bin/antfly" ]; then
+        log "ERROR: build for antfly main ($sha) did not produce zig-out/bin/antfly; tail of $build_log:"
         tail -80 "$build_log" >&2 || true
         return 1
     fi
-    if [ ! -x "$ANTFLY_DIR/pkg/termite/zig-out/bin/termite" ]; then
-        log "ERROR: build for $ref ($sha) did not produce zig-out/bin/termite; tail of $build_log:"
-        tail -80 "$build_log" >&2 || true
-        return 1
-    fi
-    cp "$ANTFLY_DIR/pkg/termite/zig-out/bin/termite" "$out_bin"
-}
-
-antfly_main_termite_layout() {
-    local src_dir="${1:-$ANTFLY_MAIN_SRC_DIR}"
-
-    if [ -f "$src_dir/go/pkg/termite/go.mod" ] && [ -d "$src_dir/go/pkg/termite/cmd" ]; then
-        printf '%s\t%s\t%s\n' "$src_dir/go/pkg/termite" ". ./cmd/..." "$src_dir/go/pkg/termite"
-        return 0
-    fi
-
-    if [ -d "$src_dir/lib/termite" ] && [ -d "$src_dir/pkg/termite/cmd" ]; then
-        printf '%s\t%s\t%s\n' "$src_dir" "./lib/termite" "$src_dir/pkg/termite"
-        return 0
-    fi
-
-    log "ERROR: unable to find public Antfly Termite layout under $src_dir"
-    return 1
-}
-
-build_antfly_main_termite() {
-    local sha="$1"
-    local out_dir="$2"
-    local out_bin="$out_dir/termite"
-    local build_log="$out_dir/build.log"
-    local test_dir
-    local test_pkgs
-    local build_dir
-    local test_args
-
-    mkdir -p "$out_dir"
-    git -C "$ANTFLY_MAIN_SRC_DIR" checkout --quiet --force origin/main
-    IFS=$'\t' read -r test_dir test_pkgs build_dir < <(antfly_main_termite_layout "$ANTFLY_MAIN_SRC_DIR")
-    read -r -a test_args <<< "$test_pkgs"
-
-    log "go testing Antfly main Termite module ($sha)..."
-    if ! run_with_timeout 600 bash -c \
-        "cd '$test_dir' && GOEXPERIMENT=simd go test ${test_args[*]} >'$build_log' 2>&1"; then
-        log "ERROR: go test failed for Antfly main Termite module ($sha); tail of $build_log:"
-        tail -80 "$build_log" >&2 || true
-        return 1
-    fi
-
-    log "building Termite (public antfly repo) CLI ($sha)..."
-    if ! run_with_timeout 1800 bash -c \
-        "cd '$build_dir' && GOEXPERIMENT=simd go build -o '$out_bin' ./cmd >>'$build_log' 2>&1"; then
-        log "ERROR: go build failed for Termite (public antfly repo) CLI ($sha); tail of $build_log:"
-        tail -80 "$build_log" >&2 || true
-        return 1
-    fi
-    if [ ! -x "$out_bin" ]; then
-        log "ERROR: Termite (public antfly repo) build did not produce $out_bin; tail of $build_log:"
-        tail -80 "$build_log" >&2 || true
-        return 1
-    fi
+    cp "$build_dir/zig-out/bin/antfly" "$out_bin"
 }
 
 if [[ "${NIGHTLY_BENCH_LIB_ONLY:-false}" == "true" ]]; then
@@ -323,38 +290,30 @@ fi
 
 trap notify_failure ERR
 
-# ─── Fetch latest code ───────────────────────────────────────────
-log "fetching antfly-zig..."
-if ! fetch_antfly_zig; then
-    log "warning: fetch failed; continuing with cached origin refs/tags"
+# ─── Stable: brew-installed antfly ───────────────────────────────
+if [ -z "${STABLE_BIN:-}" ]; then
+    log "ERROR: no stable antfly binary found on PATH (override with ANTFLY_STABLE_BIN)"
+    exit 1
 fi
+if [ ! -x "$STABLE_BIN" ]; then
+    log "ERROR: stable antfly binary at $STABLE_BIN is not executable"
+    exit 1
+fi
+STABLE_VERSION="$($STABLE_BIN --version 2>/dev/null | head -1 | awk '{print $NF}' || echo unknown)"
+STABLE_LABEL="antfly (brew $STABLE_VERSION)"
 
-log "fetching Antfly main..."
-if ! ensure_antfly_main_repo; then
-    log "warning: Antfly main fetch failed; continuing with cached origin refs/tags"
-fi
+# ─── Latest: build antfly from antfly/zig ────────────────────────
+log "fetching antfly main into $ANTFLY_SRC_DIR..."
+ensure_antfly_repo
 
 ensure_model
 
-STABLE_SHA=$(git -C "$ANTFLY_DIR" rev-parse --short "$ANTFLY_STABLE_COMMIT")
-STABLE_DATE=$(git -C "$ANTFLY_DIR" log -1 --format=%cs "$ANTFLY_STABLE_COMMIT")
-LATEST_SHA=$(git -C "$ANTFLY_DIR" rev-parse --short origin/main)
-LATEST_DATE=$(git -C "$ANTFLY_DIR" log -1 --format=%cs origin/main)
-ANTFLY_MAIN_SHA=$(git -C "$ANTFLY_MAIN_SRC_DIR" rev-parse --short origin/main)
-ANTFLY_MAIN_DATE=$(git -C "$ANTFLY_MAIN_SRC_DIR" log -1 --format=%cs origin/main)
-STABLE_LABEL="termite-zig stable ($STABLE_DATE)"
-LATEST_LABEL="termite-zig latest ($LATEST_DATE)"
-ANTFLY_MAIN_LABEL="Termite (public antfly repo)"
+LATEST_SHA=$(git -C "$ANTFLY_SRC_DIR" rev-parse --short origin/main)
+LATEST_DATE=$(git -C "$ANTFLY_SRC_DIR" log -1 --format=%cs origin/main)
+LATEST_LABEL="antfly latest ($LATEST_DATE)"
 
-# ─── Build pinned stable, latest origin/main, and Antfly main ────
-log "building pinned stable antfly-zig ($STABLE_SHA)..."
-build_termite "$ANTFLY_STABLE_COMMIT" "$STABLE_SHA" "$STABLE_DIR"
-
-log "building latest antfly-zig origin/main ($LATEST_SHA)..."
-build_termite "origin/main" "$LATEST_SHA" "$LATEST_DIR"
-
-log "building Termite (public antfly repo) ($ANTFLY_MAIN_SHA)..."
-build_antfly_main_termite "$ANTFLY_MAIN_SHA" "$ANTFLY_MAIN_DIR"
+log "building latest antfly from $ANTFLY_SRC_DIR ($LATEST_SHA)..."
+build_latest_antfly "$LATEST_SHA" "$LATEST_DIR"
 
 # ─── Run benchmark ────────────────────────────────────────────────
 log "running benchmark..."
@@ -364,35 +323,31 @@ BENCH_ARGS=(
     -model-dir "$MODEL_DIR"
     -llama-cli "llama-cli"
     -prompt-file "$PROMPT_FILE"
-    -zig-clean "$STABLE_BIN"
-    -zig-clean-dir "$ANTFLY_DIR"
-    -zig-exp "$LATEST_BIN"
-    -zig-exp-dir "$ANTFLY_DIR"
-    -termite "$ANTFLY_MAIN_BIN"
-    -termite-dir "$ANTFLY_MAIN_SRC_DIR"
-    -termite-name "$ANTFLY_MAIN_LABEL"
+    -antfly-stable "$STABLE_BIN"
+    -antfly-stable-name "$STABLE_LABEL"
+    -antfly-latest "$LATEST_BIN"
+    -antfly-latest-dir "$ANTFLY_SRC_DIR"
+    -antfly-latest-name "$LATEST_LABEL"
     -output "$RESULTS"
 )
 
 cd "$CIRCUS_DIR"
 go run ./cmd/bench "${BENCH_ARGS[@]}" 2>&1
 
-# ─── Fixup engine names in output ────────────────────────────────
+# ─── Fixup engine version line for stable ────────────────────────
+# Stable has no source dir so the bench harness can't compute a git hash.
+# Inject the brew version so the Versions block stays useful.
 STABLE_LABEL_ESCAPED="$(escape_sed_replacement "$STABLE_LABEL")"
-LATEST_LABEL_ESCAPED="$(escape_sed_replacement "$LATEST_LABEL")"
-ANTFLY_MAIN_LABEL_ESCAPED="$(escape_sed_replacement "$ANTFLY_MAIN_LABEL")"
 sed -i '' \
-    -e "s/termite-zig (clean)/$STABLE_LABEL_ESCAPED/g" \
-    -e "s/termite-zig (exp)/$LATEST_LABEL_ESCAPED/g" \
-    -e "s/- $STABLE_LABEL_ESCAPED: \`[^\`]*\`/- $STABLE_LABEL_ESCAPED: \`$STABLE_SHA\`/g" \
-    -e "s/- $LATEST_LABEL_ESCAPED: \`[^\`]*\`/- $LATEST_LABEL_ESCAPED: \`$LATEST_SHA\`/g" \
-    -e "s/- $ANTFLY_MAIN_LABEL_ESCAPED: \`[^\`]*\`/- $ANTFLY_MAIN_LABEL_ESCAPED: \`$ANTFLY_MAIN_SHA\`/g" \
-    "$RESULTS"
+    -e "/\*\*Versions:\*\*/a\\
+- $STABLE_LABEL_ESCAPED: \`$STABLE_VERSION\`
+" \
+    "$RESULTS" 2>/dev/null || true
 
 log "results written to $RESULTS"
 
-# Leave antfly-zig checked out at the latest benchmarked ref for inspection.
-git -C "$ANTFLY_DIR" checkout --quiet origin/main
+# Leave the antfly source checkout at origin/main for inspection.
+git -C "$ANTFLY_SRC_DIR" checkout --quiet origin/main
 
 # ─── Post to Zulip ───────────────────────────────────────────────
 if $POST_ZULIP; then
