@@ -21,13 +21,12 @@ var (
 	modelDir  = flag.String("model-dir", "", "Path to termite model directory")
 	llamaBin  = flag.String("llama-cli", "llama-cli", "Path to llama-cli binary")
 
-	zigCleanBin = flag.String("zig-clean", "", "Path to termite-zig-clean binary")
-	zigCleanDir = flag.String("zig-clean-dir", "", "Path to termite-zig-clean repo (for git hash)")
-	zigExpBin   = flag.String("zig-exp", "", "Path to termite-zig-experimentation binary")
-	zigExpDir   = flag.String("zig-exp-dir", "", "Path to termite-zig-experimentation repo")
-	termiteBin  = flag.String("termite", "", "Path to termite (main repo) binary")
-	termiteDir  = flag.String("termite-dir", "", "Path to termite repo (for git hash)")
-	termiteName = flag.String("termite-name", "termite", "Display name for termite (main repo) binary")
+	antflyStableBin  = flag.String("antfly-stable", "", "Path to stable `antfly` binary (e.g. brew-installed)")
+	antflyStableDir  = flag.String("antfly-stable-dir", "", "Source dir for stable antfly version reporting (optional)")
+	antflyStableName = flag.String("antfly-stable-name", "antfly (brew stable)", "Display name for stable antfly")
+	antflyLatestBin  = flag.String("antfly-latest", "", "Path to latest `antfly` binary built from antfly/zig")
+	antflyLatestDir  = flag.String("antfly-latest-dir", "", "Path to antfly source repo (for git hash)")
+	antflyLatestName = flag.String("antfly-latest-name", "antfly (latest zig)", "Display name for latest antfly")
 
 	prompt     = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
 	promptFile = flag.String("prompt-file", "", "Path to newline-delimited prompts")
@@ -74,10 +73,23 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// hasGenerate probes whether a termite binary supports the `generate` CLI subcommand.
-func hasGenerate(bin string) bool {
-	err := exec.Command(bin, "generate", "--help").Run()
-	return err == nil
+// generateSubcommand returns the subcommand chain that gets to `generate` for
+// the given antfly binary. It tries `inference generate` (latest antfly), then
+// `termite generate` (transitional), then bare `generate` (legacy termite-zig).
+// Returns nil if no shape works.
+func generateSubcommand(bin string) []string {
+	candidates := [][]string{
+		{"inference", "generate"},
+		{"termite", "generate"},
+		{"generate"},
+	}
+	for _, prefix := range candidates {
+		probe := append(append([]string{}, prefix...), "--help")
+		if err := exec.Command(bin, probe...).Run(); err == nil {
+			return prefix
+		}
+	}
+	return nil
 }
 
 func gitHash(dir string) string {
@@ -203,14 +215,15 @@ func main() {
 		"--single-turn", "--reasoning-format", "none",
 	}
 
-	termiteArgs := func(bin string) []string {
-		return []string{
-			"generate", *modelDir, promptPlaceholder,
+	termiteArgs := func(prefix []string) []string {
+		args := append([]string{}, prefix...)
+		return append(args,
+			*modelDir, promptPlaceholder,
 			"--backend", "mlx", "--max-tokens", n,
 			"--backend-budget-mb", "20480",
 			"--temperature", "0",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
-		}
+		)
 	}
 
 	var configs []benchConfig
@@ -227,36 +240,30 @@ func main() {
 		Args: append(append([]string{}, llamaBase...), "-ngl", "0"), UsePTY: true,
 	})
 
-	// termite-zig-clean
-	if *zigCleanBin != "" {
-		configs = append(configs, benchConfig{
-			Name: "termite-zig (clean)", Cmd: *zigCleanBin,
-			Args: termiteArgs(*zigCleanBin), Commit: gitHash(*zigCleanDir),
-		})
-	}
-
-	// termite-zig-experimentation (optional — silently skip if not present)
-	if *zigExpBin != "" && fileExists(*zigExpBin) {
-		configs = append(configs, benchConfig{
-			Name: "termite-zig (exp)", Cmd: *zigExpBin,
-			Args: termiteArgs(*zigExpBin), Commit: gitHash(*zigExpDir),
-		})
-	}
-
-	// termite (main repo) — probe for `generate` subcommand support
-	if *termiteBin != "" {
-		if hasGenerate(*termiteBin) {
-			configs = append(configs, benchConfig{
-				Name: *termiteName, Cmd: *termiteBin,
-				Args: termiteArgs(*termiteBin), Commit: gitHash(*termiteDir),
-			})
-		} else {
-			configs = append(configs, benchConfig{
-				Name: *termiteName, Cmd: *termiteBin,
-				Args:   nil,
-				Commit: gitHash(*termiteDir),
-			})
+	// antfly (brew stable) — probe for any generate subcommand shape.
+	if *antflyStableBin != "" && fileExists(*antflyStableBin) {
+		cfg := benchConfig{
+			Name:   *antflyStableName,
+			Cmd:    *antflyStableBin,
+			Commit: gitHash(*antflyStableDir),
 		}
+		if prefix := generateSubcommand(*antflyStableBin); prefix != nil {
+			cfg.Args = termiteArgs(prefix)
+		}
+		configs = append(configs, cfg)
+	}
+
+	// antfly (latest, built from antfly/zig).
+	if *antflyLatestBin != "" && fileExists(*antflyLatestBin) {
+		cfg := benchConfig{
+			Name:   *antflyLatestName,
+			Cmd:    *antflyLatestBin,
+			Commit: gitHash(*antflyLatestDir),
+		}
+		if prefix := generateSubcommand(*antflyLatestBin); prefix != nil {
+			cfg.Args = termiteArgs(prefix)
+		}
+		configs = append(configs, cfg)
 	}
 
 	var results []benchSummary
@@ -274,7 +281,7 @@ func main() {
 				r = benchResult{
 					Config: cfg,
 					Prompt: benchPrompt,
-					Error:  "no termite-zig-compatible `generate` subcommand; GGUF benchmark not supported by this build",
+					Error:  "no compatible `generate` subcommand (tried `inference generate`, `termite generate`, `generate`); GGUF benchmark not supported by this build",
 				}
 			} else {
 				promptCfg := cfg
