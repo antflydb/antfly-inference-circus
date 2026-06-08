@@ -5,8 +5,8 @@
 # Benchmark results (regenerated on each run)
 /results/
 
-# Experimentation repo (local only, not tracked)
-/termite-zig-experimentation/
+# Local antfly source checkout (used as the build source for the latest variant)
+/antfly/
 
 # Credentials (never commit)
 .env
