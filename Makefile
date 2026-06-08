@@ -2,11 +2,12 @@
 MODELS_DIR  := $(HOME)/.termite/models/generators
 LLAMA_CLI   ?= llama-cli
 
-# Termite builds
-TERMITE_DIR         := $(CURDIR)/termite
-TERMITE_ZIG_CLEAN   := $(CURDIR)/termite-zig-clean
-TERMITE_ZIG_EXP     := $(CURDIR)/termite-zig-experimentation
-ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Donnx=false -Dpjrt=false -Dcoreml=false
+# Antfly variants
+ANTFLY_SRC          ?= $(CURDIR)/antfly
+ANTFLY_ZIG_DIR      := $(ANTFLY_SRC)/zig
+ANTFLY_LATEST_BIN   := $(ANTFLY_ZIG_DIR)/zig-out/bin/antfly
+ANTFLY_STABLE_BIN   ?= $(shell command -v antfly 2>/dev/null)
+ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dskip-openapi=true
 
 # Benchmark settings
 BENCH_PROMPT  ?= Explain what a compiler does in two sentences.
@@ -17,8 +18,7 @@ GEMMA4_E4B_REPO := ggml-org/gemma-4-E4B-it-GGUF
 GEMMA4_E4B_FILE := gemma-4-E4B-it-Q4_K_M.gguf
 GEMMA4_E4B_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_REPO)/$(GEMMA4_E4B_FILE)
 
-# Auto-detect experimentation dir
-HAS_EXP := $(wildcard $(TERMITE_ZIG_EXP)/build.zig)
+HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
 
 .DEFAULT_GOAL := help
 
@@ -39,44 +39,38 @@ test: ## Run repo tests
 
 # ─── Builds ──────────────────────────────────────────────────────
 
-build-zig-clean: ## Build termite-zig-clean
-	cd $(TERMITE_ZIG_CLEAN) && zig build $(ZIG_BUILD_FLAGS) \
-		-Dgit-commit="$$(git rev-parse --short HEAD)"
-
-build-zig-exp: ## Build termite-zig-experimentation (if present)
-ifneq ($(HAS_EXP),)
-	cd $(TERMITE_ZIG_EXP) && zig build $(ZIG_BUILD_FLAGS) \
-		-Dgit-commit="$$(git rev-parse --short HEAD)"
+build-antfly-latest: ## Build antfly from antfly/zig with the latest zig
+ifneq ($(HAS_ANTFLY_SRC),)
+	cd $(ANTFLY_ZIG_DIR) && zig build $(ZIG_BUILD_FLAGS) \
+		-Dgit-commit="$$(git -C $(ANTFLY_SRC) rev-parse --short HEAD)"
 else
-	@echo "termite-zig-experimentation not found, skipping"
+	@echo "antfly source not found at $(ANTFLY_SRC); clone it first or set ANTFLY_SRC=/path/to/antfly"
+	@exit 1
 endif
 
-build-termite: ## Build termite (main repo)
-	cd $(TERMITE_DIR) && GOEXPERIMENT=simd go build -o bin/termite ./pkg/termite/cmd
-
-build: build-zig-clean build-zig-exp build-termite ## Build all available engines
+build: build-antfly-latest ## Build all available engines
 
 # ─── Benchmarks ──────────────────────────────────────────────────
 
 BENCH_ARGS = \
 	-model "$(GEMMA4_E4B_PATH)" \
 	-model-dir "$(MODELS_DIR)/$(GEMMA4_E4B_REPO)" \
-	-zig-clean "$(TERMITE_ZIG_CLEAN)/zig-out/bin/termite" \
-	-zig-clean-dir "$(TERMITE_ZIG_CLEAN)" \
-	-termite "$(TERMITE_DIR)/bin/termite" \
-	-termite-dir "$(TERMITE_DIR)" \
 	-llama-cli "$(LLAMA_CLI)" \
 	-prompt "$(BENCH_PROMPT)" \
 	-n $(BENCH_TOKENS) \
 	-output results/gemma4-e4b.md
 
-ifneq ($(HAS_EXP),)
-BENCH_ARGS += \
-	-zig-exp "$(TERMITE_ZIG_EXP)/zig-out/bin/termite" \
-	-zig-exp-dir "$(TERMITE_ZIG_EXP)"
+ifneq ($(ANTFLY_STABLE_BIN),)
+BENCH_ARGS += -antfly-stable "$(ANTFLY_STABLE_BIN)"
 endif
 
-bench: build ## Run benchmark (includes experimentation if present)
+ifneq ($(HAS_ANTFLY_SRC),)
+BENCH_ARGS += \
+	-antfly-latest "$(ANTFLY_LATEST_BIN)" \
+	-antfly-latest-dir "$(ANTFLY_SRC)"
+endif
+
+bench: build ## Run benchmark (stable brew antfly + latest antfly built from source)
 	go run ./cmd/bench $(BENCH_ARGS)
 	@echo ""
 	@cat results/gemma4-e4b.md
