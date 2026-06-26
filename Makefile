@@ -71,15 +71,20 @@ build: update-stable build-antfly-latest ## Refresh stable + build latest antfly
 
 # ─── Benchmarks ──────────────────────────────────────────────────
 
-# $(call bench_args,<model-path>,<model-dir>,<output-md>)
+# $(call bench_args,<model-path>,<model-dir>,<output-md>,<backend-budget-mb>)
 define bench_args
 	-model "$(1)" \
 	-model-dir "$(2)" \
 	-llama-cli "$(LLAMA_CLI)" \
 	-prompt "$(BENCH_PROMPT)" \
 	-n $(BENCH_TOKENS) \
+	-backend-budget-mb $(4) \
 	-output $(3)
 endef
+
+# 36 GB unified memory leaves ~28 GB for the inference backend after OS + Go bench harness.
+GEMMA4_E4B_BUDGET_MB := 20480
+QWEN36_A3B_BUDGET_MB := 28672
 
 EXTRA_BENCH_ARGS :=
 ifneq ($(ANTFLY_STABLE_BIN),)
@@ -93,14 +98,14 @@ endif
 
 bench-gemma4-e4b: build ## Bench llama.cpp + antfly variants on Gemma 4 E4B
 	go run ./cmd/bench \
-		$(call bench_args,$(GEMMA4_E4B_PATH),$(MODELS_DIR)/$(GEMMA4_E4B_REPO),results/gemma4-e4b.md) \
+		$(call bench_args,$(GEMMA4_E4B_PATH),$(MODELS_DIR)/$(GEMMA4_E4B_REPO),results/gemma4-e4b.md,$(GEMMA4_E4B_BUDGET_MB)) \
 		$(EXTRA_BENCH_ARGS)
 	@echo ""
 	@cat results/gemma4-e4b.md
 
 bench-qwen3.6-a3b: build ## Bench llama.cpp + antfly variants on Qwen 3.6 35B-A3B
 	go run ./cmd/bench \
-		$(call bench_args,$(QWEN36_A3B_PATH),$(MODELS_DIR)/$(QWEN36_A3B_REPO),results/qwen3.6-a3b.md) \
+		$(call bench_args,$(QWEN36_A3B_PATH),$(MODELS_DIR)/$(QWEN36_A3B_REPO),results/qwen3.6-a3b.md,$(QWEN36_A3B_BUDGET_MB)) \
 		$(EXTRA_BENCH_ARGS)
 	@echo ""
 	@cat results/qwen3.6-a3b.md

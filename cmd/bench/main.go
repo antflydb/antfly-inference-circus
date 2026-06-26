@@ -28,10 +28,11 @@ var (
 	antflyLatestDir  = flag.String("antfly-latest-dir", "", "Path to antfly source repo (for git hash)")
 	antflyLatestName = flag.String("antfly-latest-name", "antfly (latest zig)", "Display name for latest antfly")
 
-	prompt     = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
-	promptFile = flag.String("prompt-file", "", "Path to newline-delimited prompts")
-	maxTokens  = flag.Int("n", 32, "Max tokens to generate")
-	output     = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
+	prompt           = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
+	promptFile       = flag.String("prompt-file", "", "Path to newline-delimited prompts")
+	maxTokens        = flag.Int("n", 32, "Max tokens to generate")
+	output           = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
+	backendBudgetMB  = flag.Int("backend-budget-mb", 20480, "Antfly --backend-budget-mb value")
 )
 
 const promptPlaceholder = "__BENCH_PROMPT__"
@@ -229,7 +230,9 @@ func main() {
 		return append(args,
 			*modelDir, promptPlaceholder,
 			"--backend", "metal", "--max-tokens", n,
-			"--backend-budget-mb", "20480",
+			"--host-budget-mb", strconv.Itoa(*backendBudgetMB),
+			"--backend-budget-mb", strconv.Itoa(*backendBudgetMB),
+			"--combined-budget-mb", strconv.Itoa(*backendBudgetMB),
 			"--temperature", "0",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
 		)
@@ -519,7 +522,7 @@ func writeMarkdown(results []benchSummary, prompts []string) error {
 	modelName := filepath.Base(filepath.Dir(*modelGGUF)) + "/" + filepath.Base(*modelGGUF)
 	hostname, _ := os.Hostname()
 
-	b.WriteString("# Termite vs llama.cpp — Gemma 4 E4B Benchmark\n\n")
+	b.WriteString(fmt.Sprintf("# Termite vs llama.cpp — %s\n\n", filepath.Base(*modelGGUF)))
 	b.WriteString(fmt.Sprintf("**Date:** %s  \n", time.Now().Format("2006-01-02 15:04")))
 	b.WriteString(fmt.Sprintf("**Host:** %s (%s)  \n", hostname, archString()))
 	b.WriteString(fmt.Sprintf("**Model:** `%s`  \n", modelName))
