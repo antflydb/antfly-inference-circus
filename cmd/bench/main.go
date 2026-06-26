@@ -228,7 +228,7 @@ func main() {
 		args := append([]string{}, prefix...)
 		return append(args,
 			*modelDir, promptPlaceholder,
-			"--backend", "mlx", "--max-tokens", n,
+			"--backend", "metal", "--max-tokens", n,
 			"--backend-budget-mb", "20480",
 			"--temperature", "0",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
@@ -387,27 +387,41 @@ func runBench(cfg benchConfig) benchResult {
 // ─── Parsers ─────────────────────────────────────────────────────
 
 var (
-	reTermiteTiming = regexp.MustCompile(`generate_timing_ms:.*?prefill=(\d+).*?decode=(\d+).*?total=(\d+)`)
-	reTermiteTotal  = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
-	reTermiteTokens = regexp.MustCompile(`tokens=(\d+)`)
-	reLlamaPerf     = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
-	reANSI          = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	reTermiteTimingOld    = regexp.MustCompile(`generate_timing_ms:.*?prefill=(\d+).*?decode=(\d+).*?total=(\d+)`)
+	reTermiteTimingNew    = regexp.MustCompile(`(?m)^timing_ms:.*?generate=(\d+).*?total=(\d+)`)
+	reTermiteFirstToken   = regexp.MustCompile(`first_token_ms:.*?prefill=(\d+)`)
+	reTermiteTotal        = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
+	reTermiteTokens       = regexp.MustCompile(`tokens=(\d+)`)
+	reLlamaPerf           = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
+	reANSI                = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 )
 
 func termiteRunCompleted(raw string) bool {
-	return reTermiteTiming.MatchString(raw) &&
+	hasTiming := reTermiteTimingOld.MatchString(raw) || reTermiteTimingNew.MatchString(raw)
+	return hasTiming &&
 		reTermiteTokens.MatchString(raw) &&
 		strings.Contains(raw, "finish_reason=")
 }
 
 func parseTermite(r *benchResult) {
-	if m := reTermiteTiming.FindStringSubmatch(r.RawOutput); m != nil {
+	if m2 := reTermiteTokens.FindStringSubmatch(r.RawOutput); m2 != nil {
+		r.TokensGen, _ = strconv.Atoi(m2[1])
+	}
+	if m := reTermiteTimingOld.FindStringSubmatch(r.RawOutput); m != nil {
 		prefill, _ := strconv.ParseFloat(m[1], 64)
 		decode, _ := strconv.ParseFloat(m[2], 64)
 		r.PrefillMs = prefill
-		if m2 := reTermiteTokens.FindStringSubmatch(r.RawOutput); m2 != nil {
-			r.TokensGen, _ = strconv.Atoi(m2[1])
+		if decode > 0 && r.TokensGen > 0 {
+			r.GenTPS = float64(r.TokensGen) / (decode / 1000)
 		}
+	} else if m := reTermiteTimingNew.FindStringSubmatch(r.RawOutput); m != nil {
+		generate, _ := strconv.ParseFloat(m[1], 64)
+		var prefill float64
+		if fm := reTermiteFirstToken.FindStringSubmatch(r.RawOutput); fm != nil {
+			prefill, _ = strconv.ParseFloat(fm[1], 64)
+			r.PrefillMs = prefill
+		}
+		decode := generate - prefill
 		if decode > 0 && r.TokensGen > 0 {
 			r.GenTPS = float64(r.TokensGen) / (decode / 1000)
 		}
