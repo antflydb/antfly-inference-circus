@@ -228,7 +228,7 @@ func main() {
 		args := append([]string{}, prefix...)
 		return append(args,
 			*modelDir, promptPlaceholder,
-			"--backend", "auto", "--max-tokens", n,
+			"--backend", "metal", "--max-tokens", n,
 			"--backend-budget-mb", "20480",
 			"--temperature", "0",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
