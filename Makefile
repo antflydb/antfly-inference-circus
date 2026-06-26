@@ -7,6 +7,7 @@ ANTFLY_SRC          ?= $(CURDIR)/antfly
 ANTFLY_ZIG_DIR      := $(ANTFLY_SRC)/zig
 ANTFLY_LATEST_BIN   := $(ANTFLY_ZIG_DIR)/zig-out/bin/antfly
 ANTFLY_STABLE_BIN   ?= $(shell command -v antfly 2>/dev/null)
+ANTFLY_BREW_FORMULA ?= antflydb/taps/antfly
 ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dedition=full
 
 # Benchmark settings
@@ -39,16 +40,26 @@ test: ## Run repo tests
 
 # ─── Builds ──────────────────────────────────────────────────────
 
-build-antfly-latest: ## Build antfly from antfly/zig with the latest zig
+update-stable: ## brew upgrade the stable antfly so it tracks the latest published release
+	@brew update --quiet >/dev/null 2>&1 || true
+	@brew upgrade $(ANTFLY_BREW_FORMULA) 2>&1 | grep -v "already installed" || true
+	@echo "stable antfly: $$($(ANTFLY_STABLE_BIN) --version 2>/dev/null | head -1)"
+
+update-antfly: ## Fetch antfly main and fast-forward $(ANTFLY_SRC)
 ifneq ($(HAS_ANTFLY_SRC),)
-	cd $(ANTFLY_ZIG_DIR) && zig build $(ZIG_BUILD_FLAGS) \
-		-Dantfly-version="$$(git -C $(ANTFLY_SRC) rev-parse --short HEAD)"
+	@git -C $(ANTFLY_SRC) fetch --quiet --tags --prune origin
+	@git -C $(ANTFLY_SRC) checkout --quiet --force origin/main
+	@echo "antfly @ $$(git -C $(ANTFLY_SRC) log -1 --format='%h %ci %s')"
 else
-	@echo "antfly source not found at $(ANTFLY_SRC); clone it first or set ANTFLY_SRC=/path/to/antfly"
+	@echo "antfly source not found at $(ANTFLY_SRC); clone https://github.com/antflydb/antfly into $(ANTFLY_SRC) or set ANTFLY_SRC=/path/to/antfly"
 	@exit 1
 endif
 
-build: build-antfly-latest ## Build all available engines
+build-antfly-latest: update-antfly ## Build antfly from antfly/zig with the latest zig
+	cd $(ANTFLY_ZIG_DIR) && zig build $(ZIG_BUILD_FLAGS) \
+		-Dantfly-version="$$(git -C $(ANTFLY_SRC) rev-parse --short HEAD)"
+
+build: update-stable build-antfly-latest ## Refresh stable + build latest antfly
 
 # ─── Benchmarks ──────────────────────────────────────────────────
 

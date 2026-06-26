@@ -26,9 +26,12 @@ make bench                              # build + benchmark
 Gemma 4 E4B, then writes results to `results/gemma4-e4b.md`.
 
 The `antfly/` directory at the repo root is the local source checkout for the
-latest variant. It's gitignored — clone it yourself (or symlink an existing
-checkout). If `antfly/` isn't present, the latest variant is skipped from the
-benchmark; `make bench` will still run llama.cpp and the brew stable.
+latest variant. It's gitignored — clone `https://github.com/antflydb/antfly`
+into `./antfly` (or symlink an existing checkout). `make build-antfly-latest`
+(and therefore `make bench`) runs `git fetch && git checkout --force origin/main`
+before building, so the binary always tracks canonical `antflydb/antfly` HEAD.
+If `antfly/` isn't present, the latest variant is skipped; `make bench` will
+still run llama.cpp and the brew stable.
 
 ## Overriding paths
 
