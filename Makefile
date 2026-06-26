@@ -14,10 +14,15 @@ ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dedition=full
 BENCH_PROMPT  ?= Explain what a compiler does in two sentences.
 BENCH_TOKENS  ?= 32
 
-# Gemma 4 E4B
+# Gemma 4 E4B (small dense, ~5 GB)
 GEMMA4_E4B_REPO := ggml-org/gemma-4-E4B-it-GGUF
 GEMMA4_E4B_FILE := gemma-4-E4B-it-Q4_K_M.gguf
 GEMMA4_E4B_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_REPO)/$(GEMMA4_E4B_FILE)
+
+# Qwen 3.6 35B-A3B (MoE, 3B active, ~21 GB)
+QWEN36_A3B_REPO := unsloth/Qwen3.6-35B-A3B-GGUF
+QWEN36_A3B_FILE := Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+QWEN36_A3B_PATH  = $(MODELS_DIR)/$(QWEN36_A3B_REPO)/$(QWEN36_A3B_FILE)
 
 HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
 
@@ -33,6 +38,9 @@ help: ## Show this help
 
 download-gemma4-e4b: ## Download Gemma 4 E4B Q4_K_M GGUF (~5 GB)
 	go run ./cmd/model-dl -repo $(GEMMA4_E4B_REPO) -file $(GEMMA4_E4B_FILE)
+
+download-qwen3.6-a3b: ## Download Qwen 3.6 35B-A3B UD-Q4_K_M GGUF (~21 GB)
+	go run ./cmd/model-dl -repo $(QWEN36_A3B_REPO) -file $(QWEN36_A3B_FILE)
 
 test: ## Run repo tests
 	go test ./cmd/...
@@ -63,25 +71,38 @@ build: update-stable build-antfly-latest ## Refresh stable + build latest antfly
 
 # ─── Benchmarks ──────────────────────────────────────────────────
 
-BENCH_ARGS = \
-	-model "$(GEMMA4_E4B_PATH)" \
-	-model-dir "$(MODELS_DIR)/$(GEMMA4_E4B_REPO)" \
+# $(call bench_args,<model-path>,<model-dir>,<output-md>)
+define bench_args
+	-model "$(1)" \
+	-model-dir "$(2)" \
 	-llama-cli "$(LLAMA_CLI)" \
 	-prompt "$(BENCH_PROMPT)" \
 	-n $(BENCH_TOKENS) \
-	-output results/gemma4-e4b.md
+	-output $(3)
+endef
 
+EXTRA_BENCH_ARGS :=
 ifneq ($(ANTFLY_STABLE_BIN),)
-BENCH_ARGS += -antfly-stable "$(ANTFLY_STABLE_BIN)"
+EXTRA_BENCH_ARGS += -antfly-stable "$(ANTFLY_STABLE_BIN)"
 endif
-
 ifneq ($(HAS_ANTFLY_SRC),)
-BENCH_ARGS += \
+EXTRA_BENCH_ARGS += \
 	-antfly-latest "$(ANTFLY_LATEST_BIN)" \
 	-antfly-latest-dir "$(ANTFLY_SRC)"
 endif
 
-bench: build ## Run benchmark (stable brew antfly + latest antfly built from source)
-	go run ./cmd/bench $(BENCH_ARGS)
+bench-gemma4-e4b: build ## Bench llama.cpp + antfly variants on Gemma 4 E4B
+	go run ./cmd/bench \
+		$(call bench_args,$(GEMMA4_E4B_PATH),$(MODELS_DIR)/$(GEMMA4_E4B_REPO),results/gemma4-e4b.md) \
+		$(EXTRA_BENCH_ARGS)
 	@echo ""
 	@cat results/gemma4-e4b.md
+
+bench-qwen3.6-a3b: build ## Bench llama.cpp + antfly variants on Qwen 3.6 35B-A3B
+	go run ./cmd/bench \
+		$(call bench_args,$(QWEN36_A3B_PATH),$(MODELS_DIR)/$(QWEN36_A3B_REPO),results/qwen3.6-a3b.md) \
+		$(EXTRA_BENCH_ARGS)
+	@echo ""
+	@cat results/qwen3.6-a3b.md
+
+bench: bench-gemma4-e4b bench-qwen3.6-a3b ## Run all benchmarks
