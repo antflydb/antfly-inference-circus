@@ -2,23 +2,29 @@
 MODELS_DIR  := $(HOME)/.termite/models/generators
 LLAMA_CLI   ?= llama-cli
 
-# Termite builds
-TERMITE_DIR         := $(CURDIR)/termite
-TERMITE_ZIG_CLEAN   := $(CURDIR)/termite-zig-clean
-TERMITE_ZIG_EXP     := $(CURDIR)/termite-zig-experimentation
-ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Donnx=false -Dpjrt=false -Dcoreml=false
+# Antfly variants
+ANTFLY_SRC          ?= $(CURDIR)/antfly
+ANTFLY_ZIG_DIR      := $(ANTFLY_SRC)/zig
+ANTFLY_LATEST_BIN   := $(ANTFLY_ZIG_DIR)/zig-out/bin/antfly
+ANTFLY_STABLE_BIN   ?= $(shell command -v antfly 2>/dev/null)
+ANTFLY_BREW_FORMULA ?= antflydb/taps/antfly
+ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dedition=full
 
 # Benchmark settings
 BENCH_PROMPT  ?= Explain what a compiler does in two sentences.
 BENCH_TOKENS  ?= 32
 
-# Gemma 4 E4B
+# Gemma 4 E4B (small dense, ~5 GB)
 GEMMA4_E4B_REPO := ggml-org/gemma-4-E4B-it-GGUF
 GEMMA4_E4B_FILE := gemma-4-E4B-it-Q4_K_M.gguf
 GEMMA4_E4B_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_REPO)/$(GEMMA4_E4B_FILE)
 
-# Auto-detect experimentation dir
-HAS_EXP := $(wildcard $(TERMITE_ZIG_EXP)/build.zig)
+# Qwen 3.6 35B-A3B (MoE, 3B active, ~21 GB)
+QWEN36_A3B_REPO := unsloth/Qwen3.6-35B-A3B-GGUF
+QWEN36_A3B_FILE := Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+QWEN36_A3B_PATH  = $(MODELS_DIR)/$(QWEN36_A3B_REPO)/$(QWEN36_A3B_FILE)
+
+HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
 
 .DEFAULT_GOAL := help
 
@@ -33,50 +39,75 @@ help: ## Show this help
 download-gemma4-e4b: ## Download Gemma 4 E4B Q4_K_M GGUF (~5 GB)
 	go run ./cmd/model-dl -repo $(GEMMA4_E4B_REPO) -file $(GEMMA4_E4B_FILE)
 
+download-qwen3.6-a3b: ## Download Qwen 3.6 35B-A3B UD-Q4_K_M GGUF (~21 GB)
+	go run ./cmd/model-dl -repo $(QWEN36_A3B_REPO) -file $(QWEN36_A3B_FILE)
+
 test: ## Run repo tests
 	go test ./cmd/...
 	./scripts/nightly-bench-test.sh
 
 # ─── Builds ──────────────────────────────────────────────────────
 
-build-zig-clean: ## Build termite-zig-clean
-	cd $(TERMITE_ZIG_CLEAN) && zig build $(ZIG_BUILD_FLAGS) \
-		-Dgit-commit="$$(git rev-parse --short HEAD)"
+update-stable: ## brew upgrade the stable antfly so it tracks the latest published release
+	@brew update --quiet >/dev/null 2>&1 || true
+	@brew upgrade $(ANTFLY_BREW_FORMULA) 2>&1 | grep -v "already installed" || true
+	@echo "stable antfly: $$($(ANTFLY_STABLE_BIN) --version 2>/dev/null | head -1)"
 
-build-zig-exp: ## Build termite-zig-experimentation (if present)
-ifneq ($(HAS_EXP),)
-	cd $(TERMITE_ZIG_EXP) && zig build $(ZIG_BUILD_FLAGS) \
-		-Dgit-commit="$$(git rev-parse --short HEAD)"
+update-antfly: ## Fetch antfly main and fast-forward $(ANTFLY_SRC)
+ifneq ($(HAS_ANTFLY_SRC),)
+	@git -C $(ANTFLY_SRC) fetch --quiet --tags --prune origin
+	@git -C $(ANTFLY_SRC) checkout --quiet --force origin/main
+	@echo "antfly @ $$(git -C $(ANTFLY_SRC) log -1 --format='%h %ci %s')"
 else
-	@echo "termite-zig-experimentation not found, skipping"
+	@echo "antfly source not found at $(ANTFLY_SRC); clone https://github.com/antflydb/antfly into $(ANTFLY_SRC) or set ANTFLY_SRC=/path/to/antfly"
+	@exit 1
 endif
 
-build-termite: ## Build termite (main repo)
-	cd $(TERMITE_DIR) && GOEXPERIMENT=simd go build -o bin/termite ./pkg/termite/cmd
+build-antfly-latest: update-antfly ## Build antfly from antfly/zig with the latest zig
+	cd $(ANTFLY_ZIG_DIR) && zig build $(ZIG_BUILD_FLAGS) \
+		-Dantfly-version="$$(git -C $(ANTFLY_SRC) rev-parse --short HEAD)"
 
-build: build-zig-clean build-zig-exp build-termite ## Build all available engines
+build: update-stable build-antfly-latest ## Refresh stable + build latest antfly
 
 # ─── Benchmarks ──────────────────────────────────────────────────
 
-BENCH_ARGS = \
-	-model "$(GEMMA4_E4B_PATH)" \
-	-model-dir "$(MODELS_DIR)/$(GEMMA4_E4B_REPO)" \
-	-zig-clean "$(TERMITE_ZIG_CLEAN)/zig-out/bin/termite" \
-	-zig-clean-dir "$(TERMITE_ZIG_CLEAN)" \
-	-termite "$(TERMITE_DIR)/bin/termite" \
-	-termite-dir "$(TERMITE_DIR)" \
+# $(call bench_args,<model-path>,<model-dir>,<output-md>,<backend-budget-mb>)
+define bench_args
+	-model "$(1)" \
+	-model-dir "$(2)" \
 	-llama-cli "$(LLAMA_CLI)" \
 	-prompt "$(BENCH_PROMPT)" \
 	-n $(BENCH_TOKENS) \
-	-output results/gemma4-e4b.md
+	-backend-budget-mb $(4) \
+	-output $(3)
+endef
 
-ifneq ($(HAS_EXP),)
-BENCH_ARGS += \
-	-zig-exp "$(TERMITE_ZIG_EXP)/zig-out/bin/termite" \
-	-zig-exp-dir "$(TERMITE_ZIG_EXP)"
+# 36 GB unified memory leaves ~28 GB for the inference backend after OS + Go bench harness.
+GEMMA4_E4B_BUDGET_MB := 20480
+QWEN36_A3B_BUDGET_MB := 28672
+
+EXTRA_BENCH_ARGS :=
+ifneq ($(ANTFLY_STABLE_BIN),)
+EXTRA_BENCH_ARGS += -antfly-stable "$(ANTFLY_STABLE_BIN)"
+endif
+ifneq ($(HAS_ANTFLY_SRC),)
+EXTRA_BENCH_ARGS += \
+	-antfly-latest "$(ANTFLY_LATEST_BIN)" \
+	-antfly-latest-dir "$(ANTFLY_SRC)"
 endif
 
-bench: build ## Run benchmark (includes experimentation if present)
-	go run ./cmd/bench $(BENCH_ARGS)
+bench-gemma4-e4b: build ## Bench llama.cpp + antfly variants on Gemma 4 E4B
+	go run ./cmd/bench \
+		$(call bench_args,$(GEMMA4_E4B_PATH),$(MODELS_DIR)/$(GEMMA4_E4B_REPO),results/gemma4-e4b.md,$(GEMMA4_E4B_BUDGET_MB)) \
+		$(EXTRA_BENCH_ARGS)
 	@echo ""
 	@cat results/gemma4-e4b.md
+
+bench-qwen3.6-a3b: build ## Bench llama.cpp + antfly variants on Qwen 3.6 35B-A3B
+	go run ./cmd/bench \
+		$(call bench_args,$(QWEN36_A3B_PATH),$(MODELS_DIR)/$(QWEN36_A3B_REPO),results/qwen3.6-a3b.md,$(QWEN36_A3B_BUDGET_MB)) \
+		$(EXTRA_BENCH_ARGS)
+	@echo ""
+	@cat results/qwen3.6-a3b.md
+
+bench: bench-gemma4-e4b bench-qwen3.6-a3b ## Run all benchmarks

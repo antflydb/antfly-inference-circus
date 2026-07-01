@@ -2,29 +2,44 @@
 
 # termite-circus
 
-Benchmark suite for [termite](https://github.com/antflydb/termite) (Antfly's local ML inference engine) vs llama.cpp.
+Benchmark suite for the termite ML inference engine bundled in Antfly. Two
+variants are compared against [llama.cpp](https://github.com/ggml-org/llama.cpp):
+
+- **stable** — the `antfly` binary installed via brew (`brew install antflydb/taps/antfly`)
+- **latest** — `antfly` built from the [antfly](https://github.com/antflydb/antfly) main repo's `zig/` tree with the latest zig
+
+Both binaries expose a termite-zig-compatible `generate` subcommand (either as
+`antfly inference generate ...` on latest or `antfly termite generate ...` /
+bare `generate ...` on older builds). The bench harness probes for whichever
+shape the binary actually supports.
 
 ## Quick start
 
 ```bash
-git submodule update --init
-make download-gemma4-e4b   # ~5 GB GGUF, skips if already present
-make bench                 # build + benchmark
+brew install antflydb/taps/antfly       # stable variant
+git clone https://github.com/antflydb/antfly antfly   # latest variant source
+make download-gemma4-e4b                # ~5 GB GGUF, skips if already present
+make bench                              # build + benchmark
 ```
 
-`make bench` runs llama.cpp (GPU and CPU) and termite-zig-clean against Gemma 4 E4B, then writes results to `results/gemma4-e4b.md`.
+`make bench` runs llama.cpp (GPU and CPU) and both antfly variants against
+Gemma 4 E4B, then writes results to `results/gemma4-e4b.md`.
 
-## Experimenting
+The `antfly/` directory at the repo root is the local source checkout for the
+latest variant. It's gitignored — clone `https://github.com/antflydb/antfly`
+into `./antfly` (or symlink an existing checkout). `make build-antfly-latest`
+(and therefore `make bench`) runs `git fetch && git checkout --force origin/main`
+before building, so the binary always tracks canonical `antflydb/antfly` HEAD.
+If `antfly/` isn't present, the latest variant is skipped; `make bench` will
+still run llama.cpp and the brew stable.
 
-To benchmark local changes to termite-zig, clone or symlink a working copy into `termite-zig-experimentation/`:
+## Overriding paths
+
+The two antfly binaries can be overridden:
 
 ```bash
-git clone https://github.com/antflydb/termite-zig termite-zig-experimentation
-# hack on it...
-make bench   # automatically picks it up if present
+ANTFLY_STABLE_BIN=/custom/antfly ANTFLY_SRC=/path/to/antfly make bench
 ```
-
-That directory is gitignored. When it exists, `make bench` builds and benchmarks it alongside the clean baseline. When it doesn't, it's silently skipped.
 
 ## Agent workflow
 
@@ -34,26 +49,24 @@ The intended use is to have an agent run the benchmark and post results to Zulip
 Run `make bench` and post results/gemma4-e4b.md to #eval-runs > termite-gemma-4
 ```
 
-For benchmarking code changes, ask the agent to make changes in `termite-zig-experimentation/` first, then run the benchmark. The output will include both the clean baseline and the experimental build so the diff is obvious.
-
 ## Nightly automated benchmark
 
-A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific every night. It builds `antfly-zig/pkg/termite` twice: once from a manually pinned stable Antfly commit, and once from `origin/main`. It also fetches Antfly main into `.nightly/antfly-main-src`, runs `go test ./lib/termite`, and builds the Go termite CLI from `pkg/termite/cmd`. The runner verifies the configured GGUF model is present and downloads it if needed before benchmarking. The report benchmarks the buildable termite variants against llama.cpp using the nightly bug prompt and posts to `#eval-runs > termite-circus-nightly` on Zulip; `Termite (public antfly repo)` is listed even while its current CLI lacks the termite-zig `generate` command used by this GGUF benchmark.
+A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific
+several nights a week. It builds the latest `antfly` from the antfly main
+repo's `zig/` tree (cloned into `.nightly/antfly-src`, or reusing
+`./antfly` if present) and benchmarks it alongside the brew-installed
+stable `antfly` and llama.cpp.
 
-The default pinned stable Antfly commit is:
-```bash
-8caea6fc21abc4b8a96dd43a1cc7c49ae9faf188
-```
+The nightly runner:
+- verifies the configured GGUF model is present and downloads it if needed
+- builds the latest variant with `-Doptimize=ReleaseSafe -Dskip-openapi=true`,
+  adding `-Dmlx=true` if `libmlxc.dylib` is present and falling back without
+  MLX on build failure
+- posts the report to `#eval-runs > termite-circus-nightly` on Zulip
 
-To manually change the stable version for future runs, set `ANTFLY_STABLE_COMMIT` in `.env`:
-```bash
-ANTFLY_STABLE_COMMIT=<commit-sha>
-```
-
-You can verify the chosen stable commit locally with:
-```bash
-git -C antfly-zig show --no-patch --stat "$ANTFLY_STABLE_COMMIT"
-```
+The brew stable variant currently lacks the termite-zig `generate` subcommand,
+so it's listed in the table with its version string but its perf cells stay
+empty until a future release exposes `generate`.
 
 The tracked plist template lives at:
 ```bash
@@ -90,9 +103,14 @@ sudo ./scripts/schedule-launchdaemon-once.sh YYYY-MM-DD HH:MM
 ```
 
 Notes:
-- `LaunchDaemon` is the right choice when you want to install and manage the job entirely from a background shell with `sudo`.
-- If the machine is asleep at 2:05 AM, the run is still missed. Add a scheduled wake with `pmset repeat` if that matters.
-- The nightly runner leaves `antfly-zig` checked out at `origin/main` after the build.
-- Override `ANTFLY_MAIN_REPO_URL` or `ANTFLY_MAIN_SRC_DIR` in `.env` to test a different Antfly main checkout.
-- Override `MODEL_REPO` or `MODEL_FILE` in `.env` to use a different GGUF benchmark model.
-- Override `MLX_ROOT` in `.env` if `libmlxc.dylib` is not under `$HOMEBREW_PREFIX` or `~/.homebrew`.
+- `LaunchDaemon` is the right choice when you want to install and manage the
+  job entirely from a background shell with `sudo`.
+- If the machine is asleep at 2:05 AM, the run is still missed. Add a
+  scheduled wake with `pmset repeat` if that matters.
+- Override `ANTFLY_SRC_DIR` in `.env` to point at a different antfly checkout
+  (defaults to `./antfly` if present, otherwise `.nightly/antfly-src`).
+- Override `ANTFLY_STABLE_BIN` in `.env` to point at a non-brew `antfly`.
+- Override `MODEL_REPO` or `MODEL_FILE` in `.env` to use a different GGUF
+  benchmark model.
+- Override `MLX_ROOT` in `.env` if `libmlxc.dylib` is not under
+  `$HOMEBREW_PREFIX` or `~/.homebrew`.
