@@ -19,11 +19,18 @@ shape the binary actually supports.
 brew install antflydb/taps/antfly       # stable variant
 git clone https://github.com/antflydb/antfly antfly   # latest variant source
 make download-gemma4-e4b                # ~5 GB GGUF, skips if already present
+make download-gemma4-e4b-qat            # ~5 GB QAT GGUF, skips if already present
 make bench                              # build + benchmark
 ```
 
 `make bench` runs llama.cpp (GPU and CPU) and both antfly variants against
-Gemma 4 E4B, then writes results to `results/gemma4-e4b.md`.
+Gemma 4 E4B, Gemma 4 E4B QAT, and Qwen 3.6 35B-A3B. Results are written under
+`results/`.
+
+The Gemma 4 E4B QAT target uses the Hugging Face model
+`unsloth/gemma-4-E4B-it-qat-GGUF` with
+`gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf`, matching the `UD-Q4_K_XL` llama.cpp
+selector advertised by the model card.
 
 The `antfly/` directory at the repo root is the local source checkout for the
 latest variant. It's gitignored — clone `https://github.com/antflydb/antfly`
@@ -112,5 +119,8 @@ Notes:
 - Override `ANTFLY_STABLE_BIN` in `.env` to point at a non-brew `antfly`.
 - Override `MODEL_REPO` or `MODEL_FILE` in `.env` to use a different GGUF
   benchmark model.
+- For the Gemma 4 E4B QAT nightly candidate, set
+  `MODEL_REPO=unsloth/gemma-4-E4B-it-qat-GGUF` and
+  `MODEL_FILE=gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf`.
 - Override `MLX_ROOT` in `.env` if `libmlxc.dylib` is not under
   `$HOMEBREW_PREFIX` or `~/.homebrew`.

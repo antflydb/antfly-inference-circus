@@ -19,6 +19,11 @@ GEMMA4_E4B_REPO := ggml-org/gemma-4-E4B-it-GGUF
 GEMMA4_E4B_FILE := gemma-4-E4B-it-Q4_K_M.gguf
 GEMMA4_E4B_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_REPO)/$(GEMMA4_E4B_FILE)
 
+# Gemma 4 E4B QAT (small dense, ~5 GB)
+GEMMA4_E4B_QAT_REPO := unsloth/gemma-4-E4B-it-qat-GGUF
+GEMMA4_E4B_QAT_FILE := gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf
+GEMMA4_E4B_QAT_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_QAT_REPO)/$(GEMMA4_E4B_QAT_FILE)
+
 # Qwen 3.6 35B-A3B (MoE, 3B active, ~21 GB)
 QWEN36_A3B_REPO := unsloth/Qwen3.6-35B-A3B-GGUF
 QWEN36_A3B_FILE := Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
@@ -31,13 +36,16 @@ HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
 help: ## Show this help
 	@echo "termite-circus — Termite Benchmark Suite"
 	@echo ""
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
 
 # ─── Models ──────────────────────────────────────────────────────
 
 download-gemma4-e4b: ## Download Gemma 4 E4B Q4_K_M GGUF (~5 GB)
 	go run ./cmd/model-dl -repo $(GEMMA4_E4B_REPO) -file $(GEMMA4_E4B_FILE)
+
+download-gemma4-e4b-qat: ## Download Gemma 4 E4B QAT UD-Q4_K_XL GGUF (~5 GB)
+	go run ./cmd/model-dl -repo $(GEMMA4_E4B_QAT_REPO) -file $(GEMMA4_E4B_QAT_FILE)
 
 download-qwen3.6-a3b: ## Download Qwen 3.6 35B-A3B UD-Q4_K_M GGUF (~21 GB)
 	go run ./cmd/model-dl -repo $(QWEN36_A3B_REPO) -file $(QWEN36_A3B_FILE)
@@ -84,6 +92,7 @@ endef
 
 # 36 GB unified memory leaves ~28 GB for the inference backend after OS + Go bench harness.
 GEMMA4_E4B_BUDGET_MB := 20480
+GEMMA4_E4B_QAT_BUDGET_MB := 20480
 QWEN36_A3B_BUDGET_MB := 28672
 
 EXTRA_BENCH_ARGS :=
@@ -103,6 +112,13 @@ bench-gemma4-e4b: build ## Bench llama.cpp + antfly variants on Gemma 4 E4B
 	@echo ""
 	@cat results/gemma4-e4b.md
 
+bench-gemma4-e4b-qat: build ## Bench llama.cpp + antfly variants on Gemma 4 E4B QAT
+	go run ./cmd/bench \
+		$(call bench_args,$(GEMMA4_E4B_QAT_PATH),$(MODELS_DIR)/$(GEMMA4_E4B_QAT_REPO),results/gemma4-e4b-qat.md,$(GEMMA4_E4B_QAT_BUDGET_MB)) \
+		$(EXTRA_BENCH_ARGS)
+	@echo ""
+	@cat results/gemma4-e4b-qat.md
+
 bench-qwen3.6-a3b: build ## Bench llama.cpp + antfly variants on Qwen 3.6 35B-A3B
 	go run ./cmd/bench \
 		$(call bench_args,$(QWEN36_A3B_PATH),$(MODELS_DIR)/$(QWEN36_A3B_REPO),results/qwen3.6-a3b.md,$(QWEN36_A3B_BUDGET_MB)) \
@@ -110,4 +126,4 @@ bench-qwen3.6-a3b: build ## Bench llama.cpp + antfly variants on Qwen 3.6 35B-A3
 	@echo ""
 	@cat results/qwen3.6-a3b.md
 
-bench: bench-gemma4-e4b bench-qwen3.6-a3b ## Run all benchmarks
+bench: bench-gemma4-e4b bench-gemma4-e4b-qat bench-qwen3.6-a3b ## Run all benchmarks
