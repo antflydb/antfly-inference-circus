@@ -5,7 +5,7 @@
 Benchmark suite for the termite ML inference engine bundled in Antfly. Two
 variants are compared against [llama.cpp](https://github.com/ggml-org/llama.cpp):
 
-- **stable** — the `antfly` binary installed via brew (`brew install antflydb/taps/antfly`)
+- **stable** — the `antfly` binary installed via brew (`brew install antflydb/taps/antfly`), expected to track `0.2.0-rc17`
 - **latest** — `antfly` built from the [antfly](https://github.com/antflydb/antfly) main repo's `zig/` tree with the latest zig
 
 Both binaries expose a termite-zig-compatible `generate` subcommand (either as
@@ -20,6 +20,7 @@ brew install antflydb/taps/antfly       # stable variant
 git clone https://github.com/antflydb/antfly antfly   # latest variant source
 make download-gemma4-e4b                # ~5 GB GGUF, skips if already present
 make download-gemma4-e4b-qat            # ~5 GB QAT GGUF, skips if already present
+make update-stable                      # expects antfly 0.2.0-rc17 once the tap publishes it
 make bench                              # build + benchmark
 ```
 
@@ -71,9 +72,10 @@ The nightly runner:
   MLX on build failure
 - posts the report to `#eval-runs > termite-circus-nightly` on Zulip
 
-The brew stable variant currently lacks the termite-zig `generate` subcommand,
-so it's listed in the table with its version string but its perf cells stay
-empty until a future release exposes `generate`.
+The brew stable variant is expected to be `0.2.0-rc17` for Gemma 4 E4B QAT
+coverage. If the Homebrew tap has not published that release yet, the runner
+will keep benchmarking the installed stable binary and report empty perf cells
+when that binary lacks a compatible `generate` subcommand.
 
 The tracked plist template lives at:
 ```bash

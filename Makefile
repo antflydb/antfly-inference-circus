@@ -8,6 +8,7 @@ ANTFLY_ZIG_DIR      := $(ANTFLY_SRC)/zig
 ANTFLY_LATEST_BIN   := $(ANTFLY_ZIG_DIR)/zig-out/bin/antfly
 ANTFLY_STABLE_BIN   ?= $(shell command -v antfly 2>/dev/null)
 ANTFLY_BREW_FORMULA ?= antflydb/taps/antfly
+ANTFLY_STABLE_EXPECTED_VERSION ?= 0.2.0-rc17
 ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dedition=full
 
 # Benchmark settings
@@ -56,10 +57,14 @@ test: ## Run repo tests
 
 # ─── Builds ──────────────────────────────────────────────────────
 
-update-stable: ## brew upgrade the stable antfly so it tracks the latest published release
+update-stable: ## brew upgrade stable antfly and warn until it reaches the expected release
 	@brew update --quiet >/dev/null 2>&1 || true
 	@brew upgrade $(ANTFLY_BREW_FORMULA) 2>&1 | grep -v "already installed" || true
-	@echo "stable antfly: $$($(ANTFLY_STABLE_BIN) --version 2>/dev/null | head -1)"
+	@stable_version="$$($(ANTFLY_STABLE_BIN) --version 2>/dev/null | head -1 | awk '{print $$NF}')"; \
+		echo "stable antfly: $$($(ANTFLY_STABLE_BIN) --version 2>/dev/null | head -1)"; \
+		if [ -n "$(ANTFLY_STABLE_EXPECTED_VERSION)" ] && [ "$$stable_version" != "$(ANTFLY_STABLE_EXPECTED_VERSION)" ]; then \
+			echo "warning: expected antfly $(ANTFLY_STABLE_EXPECTED_VERSION); the Homebrew tap may not have published it yet"; \
+		fi
 
 update-antfly: ## Fetch antfly main and fast-forward $(ANTFLY_SRC)
 ifneq ($(HAS_ANTFLY_SRC),)
