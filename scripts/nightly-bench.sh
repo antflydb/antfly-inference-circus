@@ -13,8 +13,12 @@ CIRCUS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ANTFLY_REPO_URL="${ANTFLY_REPO_URL:-https://github.com/antflydb/antfly}"
 RESULTS="$CIRCUS_DIR/results/nightly.md"
 TERMITE_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dedition=full"
-MODEL_REPO="${MODEL_REPO:-ggml-org/gemma-4-E4B-it-GGUF}"
-MODEL_FILE="${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
+BENCH_TOKENS="${BENCH_TOKENS:-128}"
+DEFAULT_NIGHTLY_MODELS="$(cat <<'MODELS'
+qwen3.6-a3b|unsloth/Qwen3.6-35B-A3B-GGUF|Qwen3.6-35B-A3B-UD-Q4_K_M.gguf|28672
+gemma4-e4b-qat|unsloth/gemma-4-E4B-it-qat-GGUF|gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf|20480
+MODELS
+)"
 POST_ZULIP=false
 if [[ "${1:-}" == "--post-zulip" ]]; then
     POST_ZULIP=true
@@ -42,8 +46,6 @@ fi
 LATEST_DIR="$CIRCUS_DIR/.nightly/latest"
 LATEST_BIN="$LATEST_DIR/antfly"
 PROMPT_FILE="$CIRCUS_DIR/.nightly/prompts.txt"
-MODEL_DIR="$HOME/.termite/models/generators/$MODEL_REPO"
-MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
 LOG_PATH="${LOG_PATH:-$HOME/.termite-circus-nightly.log}"
 
 STABLE_BIN="${ANTFLY_STABLE_BIN:-$(command -v antfly || true)}"
@@ -124,12 +126,16 @@ ensure_antfly_repo() {
 }
 
 ensure_model() {
-    if [ -f "$MODEL_PATH" ]; then
+    local model_repo="$1"
+    local model_file="$2"
+    local model_path="$HOME/.termite/models/generators/$model_repo/$model_file"
+
+    if [ -f "$model_path" ]; then
         return
     fi
 
-    log "model missing at $MODEL_PATH; downloading $MODEL_REPO/$MODEL_FILE..."
-    run_with_timeout 7200 go run "$CIRCUS_DIR/cmd/model-dl" -repo "$MODEL_REPO" -file "$MODEL_FILE"
+    log "model missing at $model_path; downloading $model_repo/$model_file..."
+    run_with_timeout 7200 go run "$CIRCUS_DIR/cmd/model-dl" -repo "$model_repo" -file "$model_file"
 }
 
 escape_sed_replacement() {
@@ -139,18 +145,33 @@ escape_sed_replacement() {
 write_prompts() {
     mkdir -p "$CIRCUS_DIR/.nightly"
     local all_prompts=(
-        "In two sentences, explain why the peppered moth's dark form declined in Britain after the mid-20th century."
-        "In two sentences, explain why monarch butterfly populations in North America have declined in recent decades."
-        "In two sentences, explain why the spotted lanternfly is considered a serious invasive pest in the eastern United States."
-        "In two sentences, explain why the emerald ash borer kills ash trees so effectively."
-        "In two sentences, explain why bed bugs have resurged in major cities since the late 20th century."
-        "In two sentences, explain why mountain pine beetle outbreaks can devastate western forests."
-        "In two sentences, explain why Varroa mites are such a major threat to honey bee colonies."
+        "Write a concise field-note about peppered moths on soot-darkened birch trees, explaining how camouflage, predation, and cleaner air changed the frequency of light and dark forms over time."
+        "Explain how a moth's wing pattern can be shaped by nocturnal predators, resting surfaces, and industrial pollution, then include one reason biologists still treat the peppered moth story carefully."
+        "Describe a night survey in which a researcher compares pale and dark moth morphs across woodland edges, city parks, and restored forests, focusing on what evidence would make the result convincing."
+        "Summarize why moths are useful indicators of environmental change, using peppered moths as the central example and contrasting them with one other insect affected by human land use."
+        "Explain the difference between a memorable classroom version of the peppered moth story and a rigorous evolutionary study, keeping the answer grounded in selection pressure and habitat context."
+        "Write a short natural-history explanation of why moth coloration, tree bark, bird vision, and air quality can interact to produce measurable evolutionary change within a few human generations."
+        "Describe how a museum collection of moth specimens could help reconstruct environmental change across decades, including what metadata would be needed to avoid overconfident conclusions."
     )
     # Pick one prompt based on day of week (0=Sun .. 6=Sat)
     local dow
     dow=$(date +%w)
     echo "${all_prompts[$dow]}" >"$PROMPT_FILE"
+}
+
+nightly_model_specs() {
+    if [ -n "${NIGHTLY_MODELS:-}" ]; then
+        printf '%s\n' "$NIGHTLY_MODELS"
+        return
+    fi
+    if [ -n "${MODEL_REPO:-}" ] || [ -n "${MODEL_FILE:-}" ]; then
+        printf 'custom|%s|%s|%s\n' \
+            "${MODEL_REPO:-ggml-org/gemma-4-E4B-it-GGUF}" \
+            "${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}" \
+            "${BACKEND_BUDGET_MB:-20480}"
+        return
+    fi
+    printf '%s\n' "$DEFAULT_NIGHTLY_MODELS"
 }
 
 run_with_timeout() {
@@ -306,8 +327,6 @@ STABLE_LABEL="antfly (brew $STABLE_VERSION)"
 log "fetching antfly main into $ANTFLY_SRC_DIR..."
 ensure_antfly_repo
 
-ensure_model
-
 LATEST_SHA=$(git -C "$ANTFLY_SRC_DIR" rev-parse --short origin/main)
 LATEST_DATE=$(git -C "$ANTFLY_SRC_DIR" log -1 --format=%cs origin/main)
 LATEST_LABEL="antfly latest ($LATEST_DATE)"
@@ -318,31 +337,56 @@ build_latest_antfly "$LATEST_SHA" "$LATEST_DIR"
 # ─── Run benchmark ────────────────────────────────────────────────
 log "running benchmark..."
 write_prompts
-BENCH_ARGS=(
-    -model "$MODEL_PATH"
-    -model-dir "$MODEL_DIR"
-    -llama-cli "llama-cli"
-    -prompt-file "$PROMPT_FILE"
-    -antfly-stable "$STABLE_BIN"
-    -antfly-stable-name "$STABLE_LABEL"
-    -antfly-latest "$LATEST_BIN"
-    -antfly-latest-dir "$ANTFLY_SRC_DIR"
-    -antfly-latest-name "$LATEST_LABEL"
-    -output "$RESULTS"
-)
+mkdir -p "$(dirname "$RESULTS")"
+{
+    echo "# Termite nightly benchmark"
+    echo
+    echo "**Date:** $(date '+%Y-%m-%d %H:%M')"
+    echo "**Host:** $(hostname)"
+    echo "**Max tokens:** $BENCH_TOKENS"
+    echo
+} >"$RESULTS"
 
 cd "$CIRCUS_DIR"
-go run ./cmd/bench "${BENCH_ARGS[@]}" 2>&1
+while IFS='|' read -r model_name model_repo model_file backend_budget_mb; do
+    [ -n "$model_name" ] || continue
+    model_dir="$HOME/.termite/models/generators/$model_repo"
+    model_path="$model_dir/$model_file"
+    model_results="$CIRCUS_DIR/results/nightly-$model_name.md"
 
-# ─── Fixup engine version line for stable ────────────────────────
-# Stable has no source dir so the bench harness can't compute a git hash.
-# Inject the brew version so the Versions block stays useful.
-STABLE_LABEL_ESCAPED="$(escape_sed_replacement "$STABLE_LABEL")"
-sed -i '' \
-    -e "/\*\*Versions:\*\*/a\\
+    ensure_model "$model_repo" "$model_file"
+    log "running benchmark for $model_name..."
+    BENCH_ARGS=(
+        -model "$model_path"
+        -model-dir "$model_dir"
+        -llama-cli "llama-cli"
+        -prompt-file "$PROMPT_FILE"
+        -n "$BENCH_TOKENS"
+        -backend-budget-mb "$backend_budget_mb"
+        -antfly-stable "$STABLE_BIN"
+        -antfly-stable-name "$STABLE_LABEL"
+        -antfly-latest "$LATEST_BIN"
+        -antfly-latest-dir "$ANTFLY_SRC_DIR"
+        -antfly-latest-name "$LATEST_LABEL"
+        -output "$model_results"
+    )
+
+    go run ./cmd/bench "${BENCH_ARGS[@]}" 2>&1
+
+    # Stable has no source dir so the bench harness can't compute a git hash.
+    # Inject the brew version so the Versions block stays useful.
+    STABLE_LABEL_ESCAPED="$(escape_sed_replacement "$STABLE_LABEL")"
+    sed -i '' \
+        -e "/\*\*Versions:\*\*/a\\
 - $STABLE_LABEL_ESCAPED: \`$STABLE_VERSION\`
 " \
-    "$RESULTS" 2>/dev/null || true
+        "$model_results" 2>/dev/null || true
+
+    {
+        echo
+        cat "$model_results"
+    } >>"$RESULTS"
+done < <(nightly_model_specs)
 
 log "results written to $RESULTS"
 

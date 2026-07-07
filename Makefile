@@ -12,8 +12,8 @@ ANTFLY_STABLE_EXPECTED_VERSION ?= 0.2.0-rc17
 ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dedition=full
 
 # Benchmark settings
-BENCH_PROMPT  ?= Explain what a compiler does in two sentences.
-BENCH_TOKENS  ?= 32
+BENCH_PROMPT  ?= Describe how peppered moths became a classic example in evolutionary biology, then explain one caveat scientists should remember when using the story in classrooms.
+BENCH_TOKENS  ?= 128
 
 # Gemma 4 E4B (small dense, ~5 GB)
 GEMMA4_E4B_REPO := ggml-org/gemma-4-E4B-it-GGUF

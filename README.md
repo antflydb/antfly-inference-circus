@@ -66,7 +66,9 @@ repo's `zig/` tree (cloned into `.nightly/antfly-src`, or reusing
 stable `antfly` and llama.cpp.
 
 The nightly runner:
-- verifies the configured GGUF model is present and downloads it if needed
+- verifies the configured GGUF models are present and downloads them if needed
+- runs two models by default: Qwen 3.6 35B-A3B and Gemma 4 E4B QAT
+- generates 128 tokens by default from a rotating moth-themed prompt
 - builds the latest variant with `-Doptimize=ReleaseSafe -Dskip-openapi=true`,
   adding `-Dmlx=true` if `libmlxc.dylib` is present and falling back without
   MLX on build failure
@@ -116,6 +118,9 @@ Notes:
   job entirely from a background shell with `sudo`.
 - If the machine is asleep at 2:05 AM, the run is still missed. Add a
   scheduled wake with `pmset repeat` if that matters.
+- Override `NIGHTLY_MODELS` in `.env` to provide newline-delimited
+  `name|repo|file|backend_budget_mb` model specs, or keep using `MODEL_REPO`
+  and `MODEL_FILE` for a single-model run.
 - Override `ANTFLY_SRC_DIR` in `.env` to point at a different antfly checkout
   (defaults to `./antfly` if present, otherwise `.nightly/antfly-src`).
 - Override `ANTFLY_STABLE_BIN` in `.env` to point at a non-brew `antfly`.
