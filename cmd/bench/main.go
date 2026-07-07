@@ -222,7 +222,7 @@ func main() {
 	llamaBase := []string{
 		"-m", *modelGGUF, "-p", promptPlaceholder, "-n", n,
 		"--temp", "0", "--no-display-prompt", "--perf",
-		"--single-turn", "--reasoning-format", "none",
+		"--single-turn", "--reasoning-format", "none", "--ignore-eos",
 	}
 
 	termiteArgs := func(prefix []string) []string {
@@ -234,6 +234,7 @@ func main() {
 			"--backend-budget-mb", strconv.Itoa(*backendBudgetMB),
 			"--combined-budget-mb", strconv.Itoa(*backendBudgetMB),
 			"--temperature", "0",
+			"--ignore-eos",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
 		)
 	}
