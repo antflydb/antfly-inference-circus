@@ -28,11 +28,11 @@ var (
 	antflyLatestDir  = flag.String("antfly-latest-dir", "", "Path to antfly source repo (for git hash)")
 	antflyLatestName = flag.String("antfly-latest-name", "antfly (latest zig)", "Display name for latest antfly")
 
-	prompt           = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
-	promptFile       = flag.String("prompt-file", "", "Path to newline-delimited prompts")
-	maxTokens        = flag.Int("n", 32, "Max tokens to generate")
-	output           = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
-	backendBudgetMB  = flag.Int("backend-budget-mb", 20480, "Antfly --backend-budget-mb value")
+	prompt          = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
+	promptFile      = flag.String("prompt-file", "", "Path to newline-delimited prompts")
+	maxTokens       = flag.Int("n", 32, "Max tokens to generate")
+	output          = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
+	backendBudgetMB = flag.Int("backend-budget-mb", 20480, "Antfly --backend-budget-mb value")
 )
 
 const promptPlaceholder = "__BENCH_PROMPT__"
@@ -46,27 +46,29 @@ type benchConfig struct {
 }
 
 type benchResult struct {
-	Config    benchConfig
-	Prompt    string
-	GenTPS    float64
-	PromptTPS float64
-	PrefillMs float64
-	PeakRSSMB float64
-	WallSec   float64
-	TokensGen int
-	RawOutput string
-	Error     string
+	Config       benchConfig
+	Prompt       string
+	GenTPS       float64
+	PromptTPS    float64
+	PrefillMs    float64
+	PeakRSSMB    float64
+	BackendMemMB float64
+	WallSec      float64
+	TokensGen    int
+	RawOutput    string
+	Error        string
 }
 
 type benchSummary struct {
-	Config    benchConfig
-	GenTPS    float64
-	PrefillMs float64
-	PeakRSSMB float64
-	WallSec   float64
-	TokensGen int
-	RawOutput string
-	Error     string
+	Config       benchConfig
+	GenTPS       float64
+	PrefillMs    float64
+	PeakRSSMB    float64
+	BackendMemMB float64
+	WallSec      float64
+	TokensGen    int
+	RawOutput    string
+	Error        string
 }
 
 func fileExists(path string) bool {
@@ -153,8 +155,9 @@ func summarizeRuns(cfg benchConfig, runs []benchResult) benchSummary {
 		return summary
 	}
 
-	var genSum, prefillSum, peakSum, wallSum float64
+	var genSum, prefillSum, peakSum, backendMemSum, wallSum float64
 	var successCount int
+	var backendMemCount int
 	var raw strings.Builder
 
 	for _, run := range runs {
@@ -179,6 +182,10 @@ func summarizeRuns(cfg benchConfig, runs []benchResult) benchSummary {
 		genSum += run.GenTPS
 		prefillSum += run.PrefillMs
 		peakSum += run.PeakRSSMB
+		if run.BackendMemMB > 0 {
+			backendMemSum += run.BackendMemMB
+			backendMemCount++
+		}
 		wallSum += run.WallSec
 		summary.TokensGen += run.TokensGen
 	}
@@ -192,6 +199,9 @@ func summarizeRuns(cfg benchConfig, runs []benchResult) benchSummary {
 	summary.GenTPS = genSum / float64(successCount)
 	summary.PrefillMs = prefillSum / float64(successCount)
 	summary.PeakRSSMB = peakSum / float64(successCount)
+	if backendMemCount > 0 {
+		summary.BackendMemMB = backendMemSum / float64(backendMemCount)
+	}
 	summary.WallSec = wallSum / float64(successCount)
 	summary.TokensGen /= successCount
 	return summary
@@ -307,8 +317,12 @@ func main() {
 			if r.Error != "" {
 				fmt.Fprintf(os.Stderr, "  ERROR: %s\n", r.Error)
 			} else {
-				fmt.Fprintf(os.Stderr, "  gen: %.1f tok/s | prefill: %.0fms | RSS: %.0f MB | wall: %.1fs\n",
-					r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec)
+				backendMem := "—"
+				if r.BackendMemMB > 0 {
+					backendMem = fmt.Sprintf("%.0f MB", r.BackendMemMB)
+				}
+				fmt.Fprintf(os.Stderr, "  gen: %.1f tok/s | prefill: %.0fms | RSS: %.0f MB | backend mem: %s | wall: %.1fs\n",
+					r.GenTPS, r.PrefillMs, r.PeakRSSMB, backendMem, r.WallSec)
 			}
 			runs = append(runs, r)
 		}
@@ -391,13 +405,14 @@ func runBench(cfg benchConfig) benchResult {
 // ─── Parsers ─────────────────────────────────────────────────────
 
 var (
-	reTermiteTimingOld    = regexp.MustCompile(`generate_timing_ms:.*?prefill=(\d+).*?decode=(\d+).*?total=(\d+)`)
-	reTermiteTimingNew    = regexp.MustCompile(`(?m)^timing_ms:.*?generate=(\d+).*?total=(\d+)`)
-	reTermiteFirstToken   = regexp.MustCompile(`first_token_ms:.*?prefill=(\d+)`)
-	reTermiteTotal        = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
-	reTermiteTokens       = regexp.MustCompile(`tokens=(\d+)`)
-	reLlamaPerf           = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
-	reANSI                = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	reTermiteTimingOld  = regexp.MustCompile(`generate_timing_ms:.*?prefill=(\d+).*?decode=(\d+).*?total=(\d+)`)
+	reTermiteTimingNew  = regexp.MustCompile(`(?m)^timing_ms:.*?generate=(\d+).*?total=(\d+)`)
+	reTermiteFirstToken = regexp.MustCompile(`first_token_ms:.*?prefill=(\d+)`)
+	reTermiteTotal      = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
+	reTermiteTokens     = regexp.MustCompile(`tokens=(\d+)`)
+	reTermiteBackendMem = regexp.MustCompile(`metal_runtime_memory:.*?\btotal_mb=(\d+)`)
+	reLlamaPerf         = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
+	reANSI              = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 )
 
 func termiteRunCompleted(raw string) bool {
@@ -410,6 +425,9 @@ func termiteRunCompleted(raw string) bool {
 func parseTermite(r *benchResult) {
 	if m2 := reTermiteTokens.FindStringSubmatch(r.RawOutput); m2 != nil {
 		r.TokensGen, _ = strconv.Atoi(m2[1])
+	}
+	if mm := reTermiteBackendMem.FindStringSubmatch(r.RawOutput); mm != nil {
+		r.BackendMemMB, _ = strconv.ParseFloat(mm[1], 64)
 	}
 	if m := reTermiteTimingOld.FindStringSubmatch(r.RawOutput); m != nil {
 		prefill, _ := strconv.ParseFloat(m[1], 64)
@@ -553,18 +571,23 @@ func writeMarkdown(results []benchSummary, prompts []string) error {
 	b.WriteString("**Notes:**\n")
 	b.WriteString("- Prefill (ms) for llama.cpp = wall time minus generation time (includes model load)\n")
 	b.WriteString("- Prefill (ms) for termite = reported prefill time (excludes model load)\n")
-	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals\n\n")
+	b.WriteString("- Process RSS measured via `ps` polling at 200ms intervals\n")
+	b.WriteString("- Backend memory is Antfly-reported Metal runtime memory when available; llama.cpp does not report this field\n\n")
 
 	// Table
-	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak RSS (MB) | Wall (s) | Tokens |\n")
-	b.WriteString("|--------|-------------|--------------|---------------|----------|--------|\n")
+	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Process RSS (MB) | Backend Mem (MB) | Wall (s) | Tokens |\n")
+	b.WriteString("|--------|-------------|--------------|------------------|------------------|----------|--------|\n")
 	for _, r := range results {
 		if r.Error != "" {
-			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — |\n", r.Config.Name))
+			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — | — |\n", r.Config.Name))
 			continue
 		}
-		b.WriteString(fmt.Sprintf("| %s | %.1f | %.0f | %.0f | %.1f | %d |\n",
-			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec, r.TokensGen))
+		backendMem := "—"
+		if r.BackendMemMB > 0 {
+			backendMem = fmt.Sprintf("%.0f", r.BackendMemMB)
+		}
+		b.WriteString(fmt.Sprintf("| %s | %.1f | %.0f | %.0f | %s | %.1f | %d |\n",
+			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB, backendMem, r.WallSec, r.TokensGen))
 	}
 	b.WriteString("\n")
 
