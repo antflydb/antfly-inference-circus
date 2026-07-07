@@ -249,7 +249,7 @@ func main() {
 	// llama.cpp CPU
 	configs = append(configs, benchConfig{
 		Name: "llama.cpp (CPU)", Cmd: *llamaBin,
-		Args: append(append([]string{}, llamaBase...), "-ngl", "0"), UsePTY: true,
+		Args: append(append([]string{}, llamaBase...), "-ngl", "0", "--no-kv-offload"), UsePTY: true,
 	})
 
 	// antfly (brew stable) — probe for any generate subcommand shape.
