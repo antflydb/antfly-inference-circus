@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Nightly termite benchmark: brew-installed antfly (stable) vs antfly built
+# Nightly Antfly inference benchmark: brew-installed antfly (stable) vs antfly built
 # from antfly main with the latest zig (latest, runnable as `antfly inference`).
 # Intended to run non-interactively from launchd/cron.
 #
@@ -12,7 +12,7 @@ set -Eeuo pipefail
 CIRCUS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ANTFLY_REPO_URL="${ANTFLY_REPO_URL:-https://github.com/antflydb/antfly}"
 RESULTS="$CIRCUS_DIR/results/nightly.md"
-TERMITE_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dedition=full"
+ANTFLY_BUILD_FLAGS_BASE="-Doptimize=ReleaseSafe -Dedition=full"
 MODEL_REPO="${MODEL_REPO:-ggml-org/gemma-4-E4B-it-GGUF}"
 MODEL_FILE="${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
 POST_ZULIP=false
@@ -42,9 +42,9 @@ fi
 LATEST_DIR="$CIRCUS_DIR/.nightly/latest"
 LATEST_BIN="$LATEST_DIR/antfly"
 PROMPT_FILE="$CIRCUS_DIR/.nightly/prompts.txt"
-MODEL_DIR="$HOME/.termite/models/generators/$MODEL_REPO"
+MODEL_DIR="$HOME/.antfly/inference/models/generators/$MODEL_REPO"
 MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
-LOG_PATH="${LOG_PATH:-$HOME/.termite-circus-nightly.log}"
+LOG_PATH="${LOG_PATH:-$HOME/.antfly-inference-nightly.log}"
 
 STABLE_BIN="${ANTFLY_STABLE_BIN:-$(command -v antfly || true)}"
 
@@ -57,7 +57,7 @@ post_zulip_file() {
             "$ZULIP_SITE/api/v1/messages" \
             --data-urlencode type=stream \
             --data-urlencode to=eval-runs \
-            --data-urlencode topic=termite-circus-nightly \
+            --data-urlencode topic=antfly-inference-nightly \
             --data-urlencode "content@$file" \
             > /dev/null
     else
@@ -74,7 +74,7 @@ notify_failure() {
     if $POST_ZULIP; then
         msg="$(mktemp)"
         {
-            echo "# Termite nightly benchmark failed"
+            echo "# Antfly inference nightly benchmark failed"
             echo
             echo "**Date:** $(date '+%Y-%m-%d %H:%M')"
             echo "**Host:** $(hostname)"
@@ -221,9 +221,9 @@ zig_for_build_dir() {
     fi
 }
 
-termite_build_flags_for_build_dir() {
+antfly_build_flags_for_build_dir() {
     local build_dir="$1"
-    local flags="$TERMITE_BUILD_FLAGS_BASE"
+    local flags="$ANTFLY_BUILD_FLAGS_BASE"
     local build_zig="$build_dir/build.zig"
     if [ -f "$MLX_ROOT/lib/libmlxc.dylib" ] && grep -q '"mlx"' "$build_zig" 2>/dev/null; then
         flags="$flags -Dmlx=true"
@@ -234,9 +234,9 @@ termite_build_flags_for_build_dir() {
     printf '%s' "$flags"
 }
 
-termite_build_flags_without_mlx() {
+antfly_build_flags_without_mlx() {
     local build_dir="$1"
-    local flags="$TERMITE_BUILD_FLAGS_BASE"
+    local flags="$ANTFLY_BUILD_FLAGS_BASE"
     local build_zig="$build_dir/build.zig"
     if grep -q '"mlx"' "$build_zig" 2>/dev/null; then
         flags="$flags -Dmlx=false"
@@ -257,13 +257,13 @@ build_latest_antfly() {
     build_dir="$(antfly_zig_build_dir "$ANTFLY_SRC_DIR")"
     mkdir -p "$out_dir"
     zig_cmd="$(zig_for_build_dir "$build_dir")"
-    build_flags="$(termite_build_flags_for_build_dir "$build_dir")"
+    build_flags="$(antfly_build_flags_for_build_dir "$build_dir")"
     log "using $zig_cmd for antfly origin/main ($sha) in $build_dir"
     if ! run_with_timeout 1800 bash -c \
         "cd '$build_dir' && $zig_cmd build $build_flags -Dantfly-version='$sha' >'$build_log' 2>&1"; then
         if [[ "$build_flags" == *"-Dmlx=true"* ]]; then
             log "warning: MLX build failed for antfly main ($sha); retrying without MLX"
-            build_flags="$(termite_build_flags_without_mlx "$build_dir")"
+            build_flags="$(antfly_build_flags_without_mlx "$build_dir")"
             if ! run_with_timeout 1800 bash -c \
                 "cd '$build_dir' && $zig_cmd build $build_flags -Dantfly-version='$sha' >'$build_log' 2>&1"; then
                 log "ERROR: build timed out or failed for antfly main ($sha); tail of $build_log:"

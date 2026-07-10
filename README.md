@@ -1,17 +1,15 @@
 <img width="2304" height="1848" alt="termite-circus" src="https://github.com/user-attachments/assets/f1feba1e-a4bf-4a37-a17d-b2c57389b10f" />
 
-# termite-circus
+# Antfly inference benchmark
 
-Benchmark suite for the termite ML inference engine bundled in Antfly. Two
+Benchmark suite for the Antfly inference surface. Two
 variants are compared against [llama.cpp](https://github.com/ggml-org/llama.cpp):
 
 - **stable** — the `antfly` binary installed via brew (`brew install antflydb/taps/antfly`)
 - **latest** — `antfly` built from the [antfly](https://github.com/antflydb/antfly) main repo's `zig/` tree with the latest zig
 
-Both binaries expose a termite-zig-compatible `generate` subcommand (either as
-`antfly inference generate ...` on latest or `antfly termite generate ...` /
-bare `generate ...` on older builds). The bench harness probes for whichever
-shape the binary actually supports.
+Both binaries must expose the Antfly 0.2 `antfly inference generate ...`
+subcommand. Older CLI shapes are not used by this harness.
 
 ## Quick start
 
@@ -46,7 +44,7 @@ ANTFLY_STABLE_BIN=/custom/antfly ANTFLY_SRC=/path/to/antfly make bench
 The intended use is to have an agent run the benchmark and post results to Zulip:
 
 ```
-Run `make bench` and post results/gemma4-e4b.md to #eval-runs > termite-gemma-4
+Run `make bench` and post results/gemma4-e4b.md to #eval-runs > antfly-inference-gemma-4
 ```
 
 ## Nightly automated benchmark
@@ -62,15 +60,14 @@ The nightly runner:
 - builds the latest variant with `-Doptimize=ReleaseSafe -Dskip-openapi=true`,
   adding `-Dmlx=true` if `libmlxc.dylib` is present and falling back without
   MLX on build failure
-- posts the report to `#eval-runs > termite-circus-nightly` on Zulip
+- posts the report to `#eval-runs > antfly-inference-nightly` on Zulip
 
-The brew stable variant currently lacks the termite-zig `generate` subcommand,
-so it's listed in the table with its version string but its perf cells stay
-empty until a future release exposes `generate`.
+If a configured Antfly binary lacks `antfly inference generate`, it is listed
+in the table with its version string but its perf cells stay empty.
 
 The tracked plist template lives at:
 ```bash
-launchd/com.termite-circus.nightly-bench.plist
+launchd/com.antfly-inference.nightly-bench.plist
 ```
 
 Install or refresh it with:
@@ -81,19 +78,19 @@ sudo ./scripts/install-launchdaemon.sh
 Manage it with:
 ```bash
 # Check status
-sudo launchctl print system/com.termite-circus.nightly-bench
+sudo launchctl print system/com.antfly-inference.nightly-bench
 
 # Stop
-sudo launchctl bootout system /Library/LaunchDaemons/com.termite-circus.nightly-bench.plist
+sudo launchctl bootout system /Library/LaunchDaemons/com.antfly-inference.nightly-bench.plist
 
 # Start
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.termite-circus.nightly-bench.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.antfly-inference.nightly-bench.plist
 
 # Trigger immediately for a smoke test
-sudo launchctl kickstart -k system/com.termite-circus.nightly-bench
+sudo launchctl kickstart -k system/com.antfly-inference.nightly-bench
 
 # View logs
-tail -f ~/.termite-circus-nightly.log
+tail -f ~/.antfly-inference-nightly.log
 
 # Manual run (without Zulip post)
 ./scripts/nightly-bench.sh

@@ -27,7 +27,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	destDir := filepath.Join(home, ".termite", "models", "generators", *repo)
+	destDir := filepath.Join(home, ".antfly", "inference", "models", "generators", *repo)
 	destPath := filepath.Join(destDir, *file)
 	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", *repo, *file)
 
@@ -218,7 +218,7 @@ func init() {
 		fmt.Fprintln(os.Stderr, "Example:")
 		fmt.Fprintln(os.Stderr, "  model-dl -repo ggml-org/gemma-4-E4B-it-GGUF -file gemma-4-e4b-it-Q4_K_M.gguf")
 		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Downloads to ~/.termite/models/generators/<repo>/<file>")
+		fmt.Fprintln(os.Stderr, "Downloads to ~/.antfly/inference/models/generators/<repo>/<file>")
 		fmt.Fprintln(os.Stderr)
 		flag.PrintDefaults()
 	}

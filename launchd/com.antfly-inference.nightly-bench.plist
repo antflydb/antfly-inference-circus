@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.termite-circus.nightly-bench</string>
+	<string>com.antfly-inference.nightly-bench</string>
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/stinkbug/rowan/termite-circus/scripts/nightly-bench.sh</string>
+		<string>/Users/stinkbug/rowan/antfly-circus/benchmarks/termite-circus/scripts/nightly-bench.sh</string>
 		<string>--post-zulip</string>
 	</array>
 
 	<key>WorkingDirectory</key>
-	<string>/Users/stinkbug/rowan/termite-circus</string>
+	<string>/Users/stinkbug/rowan/antfly-circus/benchmarks/termite-circus</string>
 
 	<key>UserName</key>
 	<string>stinkbug</string>
@@ -62,8 +62,8 @@
 	</array>
 
 	<key>StandardOutPath</key>
-	<string>/Users/stinkbug/.termite-circus-nightly.log</string>
+	<string>/Users/stinkbug/.antfly-inference-nightly.log</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/stinkbug/.termite-circus-nightly.log</string>
+	<string>/Users/stinkbug/.antfly-inference-nightly.log</string>
 </dict>
 </plist>

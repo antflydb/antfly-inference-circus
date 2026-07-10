@@ -1,5 +1,5 @@
 # ─── Config ──────────────────────────────────────────────────────
-MODELS_DIR  := $(HOME)/.termite/models/generators
+MODELS_DIR  := $(HOME)/.antfly/inference/models/generators
 LLAMA_CLI   ?= llama-cli
 
 # Antfly variants
@@ -29,7 +29,7 @@ HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
 .DEFAULT_GOAL := help
 
 help: ## Show this help
-	@echo "termite-circus — Termite Benchmark Suite"
+	@echo "termite-circus — Antfly Inference Benchmark Suite"
 	@echo ""
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'

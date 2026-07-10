@@ -18,7 +18,7 @@ import (
 
 var (
 	modelGGUF = flag.String("model", "", "Path to GGUF file (for llama-cli)")
-	modelDir  = flag.String("model-dir", "", "Path to termite model directory")
+	modelDir  = flag.String("model-dir", "", "Path to Antfly inference model directory")
 	llamaBin  = flag.String("llama-cli", "llama-cli", "Path to llama-cli binary")
 
 	antflyStableBin  = flag.String("antfly-stable", "", "Path to stable `antfly` binary (e.g. brew-installed)")
@@ -28,11 +28,11 @@ var (
 	antflyLatestDir  = flag.String("antfly-latest-dir", "", "Path to antfly source repo (for git hash)")
 	antflyLatestName = flag.String("antfly-latest-name", "antfly (latest zig)", "Display name for latest antfly")
 
-	prompt           = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
-	promptFile       = flag.String("prompt-file", "", "Path to newline-delimited prompts")
-	maxTokens        = flag.Int("n", 32, "Max tokens to generate")
-	output           = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
-	backendBudgetMB  = flag.Int("backend-budget-mb", 20480, "Antfly --backend-budget-mb value")
+	prompt          = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
+	promptFile      = flag.String("prompt-file", "", "Path to newline-delimited prompts")
+	maxTokens       = flag.Int("n", 32, "Max tokens to generate")
+	output          = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
+	backendBudgetMB = flag.Int("backend-budget-mb", 20480, "Antfly --backend-budget-mb value")
 )
 
 const promptPlaceholder = "__BENCH_PROMPT__"
@@ -74,26 +74,15 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// generateSubcommand returns the subcommand chain that gets to `generate` for
-// the given antfly binary. It checks each candidate parent's --help output for
-// `generate` listed as a subcommand. Exit codes are unreliable: the new
-// antfly's CLI prints help-on-error for invalid args, and cobra binaries
-// return 0 on unknown subcommands with --help in flight. Content matching is.
-//
-// Tries `inference` (latest antfly), `termite` (transitional brew antfly),
-// then bare (legacy termite-zig).
+// generateSubcommand returns the Antfly 0.2 inference generation command chain.
+// It checks help text instead of exit status because the CLI prints help-on-error
+// for invalid arguments.
 func generateSubcommand(bin string) []string {
-	candidates := [][]string{
-		{"inference"},
-		{"termite"},
-		nil,
-	}
-	for _, parent := range candidates {
-		help := append(append([]string{}, parent...), "--help")
-		out, _ := exec.Command(bin, help...).CombinedOutput()
-		if reGenerateSubcmd.Match(out) {
-			return append(append([]string{}, parent...), "generate")
-		}
+	parent := []string{"inference"}
+	help := append(append([]string{}, parent...), "--help")
+	out, _ := exec.Command(bin, help...).CombinedOutput()
+	if reGenerateSubcmd.Match(out) {
+		return append(parent, "generate")
 	}
 	return nil
 }
@@ -225,7 +214,7 @@ func main() {
 		"--single-turn", "--reasoning-format", "none",
 	}
 
-	termiteArgs := func(prefix []string) []string {
+	antflyInferenceArgs := func(prefix []string) []string {
 		args := append([]string{}, prefix...)
 		return append(args,
 			*modelDir, promptPlaceholder,
@@ -252,7 +241,7 @@ func main() {
 		Args: append(append([]string{}, llamaBase...), "-ngl", "0"), UsePTY: true,
 	})
 
-	// antfly (brew stable) — probe for any generate subcommand shape.
+	// antfly (brew stable) — probe for the Antfly 0.2 inference command shape.
 	if *antflyStableBin != "" && fileExists(*antflyStableBin) {
 		cfg := benchConfig{
 			Name:   *antflyStableName,
@@ -260,7 +249,7 @@ func main() {
 			Commit: gitHash(*antflyStableDir),
 		}
 		if prefix := generateSubcommand(*antflyStableBin); prefix != nil {
-			cfg.Args = termiteArgs(prefix)
+			cfg.Args = antflyInferenceArgs(prefix)
 		}
 		configs = append(configs, cfg)
 	}
@@ -273,7 +262,7 @@ func main() {
 			Commit: gitHash(*antflyLatestDir),
 		}
 		if prefix := generateSubcommand(*antflyLatestBin); prefix != nil {
-			cfg.Args = termiteArgs(prefix)
+			cfg.Args = antflyInferenceArgs(prefix)
 		}
 		configs = append(configs, cfg)
 	}
@@ -293,7 +282,7 @@ func main() {
 				r = benchResult{
 					Config: cfg,
 					Prompt: benchPrompt,
-					Error:  "no compatible `generate` subcommand (tried `inference generate`, `termite generate`, `generate`); GGUF benchmark not supported by this build",
+					Error:  "no compatible `inference generate` subcommand; GGUF benchmark not supported by this build",
 				}
 			} else {
 				promptCfg := cfg
@@ -363,10 +352,10 @@ func runBench(cfg benchConfig) benchResult {
 			Error:   fmt.Sprintf("exit: %v", err),
 			WallSec: wall.Seconds(), PeakRSSMB: float64(peakRSSKB) / 1024,
 		}
-		if !strings.Contains(cfg.Name, "llama") && termiteRunCompleted(raw) {
+		if !strings.Contains(cfg.Name, "llama") && antflyInferenceRunCompleted(raw) {
 			r.Error = ""
 			r.TokensGen = *maxTokens
-			parseTermite(&r)
+			parseAntflyInference(&r)
 		}
 		return r
 	}
@@ -382,7 +371,7 @@ func runBench(cfg benchConfig) benchResult {
 	if strings.Contains(cfg.Name, "llama") {
 		parseLlama(&r)
 	} else {
-		parseTermite(&r)
+		parseAntflyInference(&r)
 	}
 	return r
 }
@@ -390,37 +379,37 @@ func runBench(cfg benchConfig) benchResult {
 // ─── Parsers ─────────────────────────────────────────────────────
 
 var (
-	reTermiteTimingOld    = regexp.MustCompile(`generate_timing_ms:.*?prefill=(\d+).*?decode=(\d+).*?total=(\d+)`)
-	reTermiteTimingNew    = regexp.MustCompile(`(?m)^timing_ms:.*?generate=(\d+).*?total=(\d+)`)
-	reTermiteFirstToken   = regexp.MustCompile(`first_token_ms:.*?prefill=(\d+)`)
-	reTermiteTotal        = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
-	reTermiteTokens       = regexp.MustCompile(`tokens=(\d+)`)
-	reLlamaPerf           = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
-	reANSI                = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	reAntflyTimingOld  = regexp.MustCompile(`generate_timing_ms:.*?prefill=(\d+).*?decode=(\d+).*?total=(\d+)`)
+	reAntflyTimingNew  = regexp.MustCompile(`(?m)^timing_ms:.*?generate=(\d+).*?total=(\d+)`)
+	reAntflyFirstToken = regexp.MustCompile(`first_token_ms:.*?prefill=(\d+)`)
+	reAntflyTotal      = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
+	reAntflyTokens     = regexp.MustCompile(`tokens=(\d+)`)
+	reLlamaPerf        = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
+	reANSI             = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 )
 
-func termiteRunCompleted(raw string) bool {
-	hasTiming := reTermiteTimingOld.MatchString(raw) || reTermiteTimingNew.MatchString(raw)
+func antflyInferenceRunCompleted(raw string) bool {
+	hasTiming := reAntflyTimingOld.MatchString(raw) || reAntflyTimingNew.MatchString(raw)
 	return hasTiming &&
-		reTermiteTokens.MatchString(raw) &&
+		reAntflyTokens.MatchString(raw) &&
 		strings.Contains(raw, "finish_reason=")
 }
 
-func parseTermite(r *benchResult) {
-	if m2 := reTermiteTokens.FindStringSubmatch(r.RawOutput); m2 != nil {
+func parseAntflyInference(r *benchResult) {
+	if m2 := reAntflyTokens.FindStringSubmatch(r.RawOutput); m2 != nil {
 		r.TokensGen, _ = strconv.Atoi(m2[1])
 	}
-	if m := reTermiteTimingOld.FindStringSubmatch(r.RawOutput); m != nil {
+	if m := reAntflyTimingOld.FindStringSubmatch(r.RawOutput); m != nil {
 		prefill, _ := strconv.ParseFloat(m[1], 64)
 		decode, _ := strconv.ParseFloat(m[2], 64)
 		r.PrefillMs = prefill
 		if decode > 0 && r.TokensGen > 0 {
 			r.GenTPS = float64(r.TokensGen) / (decode / 1000)
 		}
-	} else if m := reTermiteTimingNew.FindStringSubmatch(r.RawOutput); m != nil {
+	} else if m := reAntflyTimingNew.FindStringSubmatch(r.RawOutput); m != nil {
 		generate, _ := strconv.ParseFloat(m[1], 64)
 		var prefill float64
-		if fm := reTermiteFirstToken.FindStringSubmatch(r.RawOutput); fm != nil {
+		if fm := reAntflyFirstToken.FindStringSubmatch(r.RawOutput); fm != nil {
 			prefill, _ = strconv.ParseFloat(fm[1], 64)
 			r.PrefillMs = prefill
 		}
@@ -429,7 +418,7 @@ func parseTermite(r *benchResult) {
 			r.GenTPS = float64(r.TokensGen) / (decode / 1000)
 		}
 	}
-	if m := reTermiteTotal.FindStringSubmatch(r.RawOutput); m != nil {
+	if m := reAntflyTotal.FindStringSubmatch(r.RawOutput); m != nil {
 		total, _ := strconv.ParseFloat(m[1], 64)
 		if total > 0 {
 			r.WallSec = total / 1000
@@ -522,7 +511,7 @@ func writeMarkdown(results []benchSummary, prompts []string) error {
 	modelName := filepath.Base(filepath.Dir(*modelGGUF)) + "/" + filepath.Base(*modelGGUF)
 	hostname, _ := os.Hostname()
 
-	b.WriteString(fmt.Sprintf("# Termite vs llama.cpp — %s\n\n", filepath.Base(*modelGGUF)))
+	b.WriteString(fmt.Sprintf("# Antfly inference vs llama.cpp — %s\n\n", filepath.Base(*modelGGUF)))
 	b.WriteString(fmt.Sprintf("**Date:** %s  \n", time.Now().Format("2006-01-02 15:04")))
 	b.WriteString(fmt.Sprintf("**Host:** %s (%s)  \n", hostname, archString()))
 	b.WriteString(fmt.Sprintf("**Model:** `%s`  \n", modelName))
@@ -551,7 +540,7 @@ func writeMarkdown(results []benchSummary, prompts []string) error {
 
 	b.WriteString("**Notes:**\n")
 	b.WriteString("- Prefill (ms) for llama.cpp = wall time minus generation time (includes model load)\n")
-	b.WriteString("- Prefill (ms) for termite = reported prefill time (excludes model load)\n")
+	b.WriteString("- Prefill (ms) for Antfly inference = reported prefill time (excludes model load)\n")
 	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals\n\n")
 
 	// Table

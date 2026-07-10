@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SOURCE_PLIST="$ROOT_DIR/launchd/com.termite-circus.nightly-bench.plist"
-TARGET_PLIST="/Library/LaunchDaemons/com.termite-circus.nightly-bench.plist"
-LABEL="com.termite-circus.nightly-bench"
+SOURCE_PLIST="$ROOT_DIR/launchd/com.antfly-inference.nightly-bench.plist"
+TARGET_PLIST="/Library/LaunchDaemons/com.antfly-inference.nightly-bench.plist"
+LABEL="com.antfly-inference.nightly-bench"
 
 if [[ ! -f "$SOURCE_PLIST" ]]; then
     echo "missing plist template: $SOURCE_PLIST" >&2
@@ -32,5 +32,5 @@ launchctl enable "system/$LABEL"
 
 echo "installed and loaded: $LABEL"
 echo "next run: 2:00 AM Monday/Wednesday/Friday"
-echo "logs: ~/.termite-circus-nightly.log"
+echo "logs: ~/.antfly-inference-nightly.log"
 launchctl print "system/$LABEL" 2>&1 | head -5

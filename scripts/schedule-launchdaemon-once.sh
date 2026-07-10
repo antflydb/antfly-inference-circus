@@ -8,7 +8,7 @@ fi
 
 DATE_ARG="$1"
 TIME_ARG="$2"
-LABEL="com.termite-circus.nightly-bench"
+LABEL="com.antfly-inference.nightly-bench"
 TARGET_PLIST="/Library/LaunchDaemons/$LABEL.plist"
 
 if [[ $EUID -ne 0 ]]; then
