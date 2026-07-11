@@ -60,29 +60,31 @@ type benchConfig struct {
 }
 
 type benchResult struct {
-	Config    benchConfig
-	Prompt    string
-	GenTPS    float64
-	PromptTPS float64
-	PrefillMs float64
-	PeakRSSMB float64
-	WallSec   float64
-	TokensGen int
-	RawOutput string
-	Error     string
+	Config       benchConfig
+	Prompt       string
+	GenTPS       float64
+	PromptTPS    float64
+	PrefillMs    float64
+	PeakRSSMB    float64
+	WiredDeltaMB float64
+	WallSec      float64
+	TokensGen    int
+	RawOutput    string
+	Error        string
 }
 
 type benchSummary struct {
-	Config    benchConfig
-	MaxTokens int
-	GenTPS    float64
-	PrefillMs float64
-	PeakRSSMB float64
-	WallSec   float64
-	TokensGen int
-	MTP       string
-	RawOutput string
-	Error     string
+	Config       benchConfig
+	MaxTokens    int
+	GenTPS       float64
+	PrefillMs    float64
+	PeakRSSMB    float64
+	WiredDeltaMB float64
+	WallSec      float64
+	TokensGen    int
+	MTP          string
+	RawOutput    string
+	Error        string
 }
 
 func fileExists(path string) bool {
@@ -204,7 +206,7 @@ func summarizeRuns(cfg benchConfig, nTokens int, runs []benchResult) benchSummar
 		}
 	}
 
-	var genSum, prefillSum, peakSum, wallSum float64
+	var genSum, prefillSum, peakSum, wiredSum, wallSum float64
 	var successCount int
 	var raw strings.Builder
 
@@ -230,6 +232,7 @@ func summarizeRuns(cfg benchConfig, nTokens int, runs []benchResult) benchSummar
 		genSum += run.GenTPS
 		prefillSum += run.PrefillMs
 		peakSum += run.PeakRSSMB
+		wiredSum += run.WiredDeltaMB
 		wallSum += run.WallSec
 		summary.TokensGen += run.TokensGen
 	}
@@ -243,6 +246,7 @@ func summarizeRuns(cfg benchConfig, nTokens int, runs []benchResult) benchSummar
 	summary.GenTPS = genSum / float64(successCount)
 	summary.PrefillMs = prefillSum / float64(successCount)
 	summary.PeakRSSMB = peakSum / float64(successCount)
+	summary.WiredDeltaMB = wiredSum / float64(successCount)
 	summary.WallSec = wallSum / float64(successCount)
 	summary.TokensGen /= successCount
 	return summary
@@ -419,14 +423,16 @@ func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
 
+	baselineWiredKB := wiredKB()
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		return benchResult{Config: cfg, Error: fmt.Sprintf("start: %v", err)}
 	}
 
-	var peakRSSKB int64
+	var peakRSSKB, peakWiredDeltaKB int64
 	done := make(chan struct{})
 	go pollRSS(cmd.Process.Pid, &peakRSSKB, done)
+	go pollWiredDelta(baselineWiredKB, &peakWiredDeltaKB, done)
 
 	err := cmd.Wait()
 	close(done)
@@ -443,6 +449,7 @@ func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
 			Config: cfg, RawOutput: raw,
 			Error:   fmt.Sprintf("exit: %v", err),
 			WallSec: wall.Seconds(), PeakRSSMB: float64(peakRSSKB) / 1024,
+			WiredDeltaMB: float64(peakWiredDeltaKB) / 1024,
 		}
 		if !strings.Contains(cfg.Name, "llama") && antflyInferenceRunCompleted(raw) {
 			r.Error = ""
@@ -454,11 +461,12 @@ func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
 	}
 
 	r := benchResult{
-		Config:    cfg,
-		RawOutput: raw,
-		WallSec:   wall.Seconds(),
-		PeakRSSMB: float64(peakRSSKB) / 1024,
-		TokensGen: nTokens,
+		Config:       cfg,
+		RawOutput:    raw,
+		WallSec:      wall.Seconds(),
+		PeakRSSMB:    float64(peakRSSKB) / 1024,
+		WiredDeltaMB: float64(peakWiredDeltaKB) / 1024,
+		TokensGen:    nTokens,
 	}
 
 	if strings.Contains(cfg.Name, "llama") {
@@ -595,6 +603,63 @@ func pollRSS(pid int, peakKB *int64, done <-chan struct{}) {
 	}
 }
 
+// pollWiredDelta tracks the peak growth of system-wide wired memory over a
+// baseline taken just before the benchmarked process starts. Metal/IOKit
+// buffers (where GPU engines keep model weights) are wired and charged to
+// the system rather than the allocating task, so process RSS misses them.
+// Requires a quiet host; the per-run cooldown keeps this usable.
+func pollWiredDelta(baselineKB int64, peakDeltaKB *int64, done <-chan struct{}) {
+	if baselineKB <= 0 {
+		return
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			delta := wiredKB() - baselineKB
+			if delta <= 0 {
+				continue
+			}
+			for {
+				old := atomic.LoadInt64(peakDeltaKB)
+				if delta <= old || atomic.CompareAndSwapInt64(peakDeltaKB, old, delta) {
+					break
+				}
+			}
+		}
+	}
+}
+
+var (
+	reVMStatPageSize = regexp.MustCompile(`page size of (\d+) bytes`)
+	reVMStatWired    = regexp.MustCompile(`Pages wired down:\s+(\d+)\.`)
+)
+
+func wiredKB() int64 {
+	out, err := exec.Command("vm_stat").Output()
+	if err != nil {
+		return 0
+	}
+	pageSize := int64(16384)
+	if m := reVMStatPageSize.FindSubmatch(out); m != nil {
+		if n, err := strconv.ParseInt(string(m[1]), 10, 64); err == nil && n > 0 {
+			pageSize = n
+		}
+	}
+	m := reVMStatWired.FindSubmatch(out)
+	if m == nil {
+		return 0
+	}
+	pages, err := strconv.ParseInt(string(m[1]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return pages * pageSize / 1024
+}
+
 func sumTreeRSS(pid int) int64 {
 	out, err := exec.Command("ps", "-eo", "pid,ppid,rss").Output()
 	if err != nil {
@@ -690,18 +755,19 @@ func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) er
 	b.WriteString("**Notes:**\n")
 	b.WriteString("- Prefill (ms) for llama.cpp = wall time minus generation time (includes model load)\n")
 	b.WriteString("- Prefill (ms) for Antfly inference = reported prefill time (excludes model load)\n")
-	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals, summed across the benchmarked process tree (client + spawned backends)\n\n")
+	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals, summed across the benchmarked process tree (client + spawned backends)\n")
+	b.WriteString("- Wired Δ is the peak growth of system-wide wired memory over a pre-launch baseline, polled at 200ms intervals; it captures Metal/IOKit model buffers that macOS charges to the system instead of the process. Requires a quiet host.\n\n")
 
 	// Table
-	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak RSS (MB) | Wall (s) | Tokens | MTP |\n")
-	b.WriteString("|--------|-------------|--------------|---------------|----------|--------|-----|\n")
+	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak RSS (MB) | Wired Δ (MB) | Wall (s) | Tokens | MTP |\n")
+	b.WriteString("|--------|-------------|--------------|---------------|--------------|----------|--------|-----|\n")
 	for _, r := range results {
 		if r.Error != "" {
-			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — | %s |\n", r.Config.Name, r.MTP))
+			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — | — | %s |\n", r.Config.Name, r.MTP))
 			continue
 		}
-		b.WriteString(fmt.Sprintf("| %s | %.3f | %.0f | %.0f | %.1f | %d | %s |\n",
-			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec, r.TokensGen, r.MTP))
+		b.WriteString(fmt.Sprintf("| %s | %.3f | %.0f | %.0f | %.0f | %.1f | %d | %s |\n",
+			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WiredDeltaMB, r.WallSec, r.TokensGen, r.MTP))
 	}
 	b.WriteString("\n")
 
