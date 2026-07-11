@@ -24,6 +24,15 @@ QWEN36_A3B_REPO := unsloth/Qwen3.6-35B-A3B-GGUF
 QWEN36_A3B_FILE := Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 QWEN36_A3B_PATH  = $(MODELS_DIR)/$(QWEN36_A3B_REPO)/$(QWEN36_A3B_FILE)
 
+# Gemma 4 E4B QAT q4_0 (Google quantization-aware checkpoint, ~5 GB)
+GEMMA4_E4B_QAT_REPO := google/gemma-4-E4B-it-qat-q4_0-gguf
+GEMMA4_E4B_QAT_FILE := gemma-4-E4B_q4_0-it.gguf
+GEMMA4_E4B_QAT_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_QAT_REPO)/$(GEMMA4_E4B_QAT_FILE)
+
+# Gemma 4 E4B MTP assistant drafter (safetensors, pulled via antfly)
+GEMMA4_E4B_MTP_ASSISTANT     := google/gemma-4-E4B-it-assistant
+GEMMA4_E4B_MTP_ASSISTANT_DIR := $(HOME)/.antfly/inference/models/$(GEMMA4_E4B_MTP_ASSISTANT)
+
 HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
 
 .DEFAULT_GOAL := help
@@ -41,6 +50,12 @@ download-gemma4-e4b: ## Download Gemma 4 E4B Q4_K_M GGUF (~5 GB)
 
 download-qwen3.6-a3b: ## Download Qwen 3.6 35B-A3B UD-Q4_K_M GGUF (~21 GB)
 	go run ./cmd/model-dl -repo $(QWEN36_A3B_REPO) -file $(QWEN36_A3B_FILE)
+
+download-gemma4-e4b-qat: ## Download Gemma 4 E4B QAT q4_0 GGUF (~5 GB)
+	go run ./cmd/model-dl -repo $(GEMMA4_E4B_QAT_REPO) -file $(GEMMA4_E4B_QAT_FILE)
+
+download-gemma4-e4b-mtp-assistant: ## Pull the Gemma 4 E4B MTP assistant drafter via antfly
+	$(ANTFLY_STABLE_BIN) inference pull $(GEMMA4_E4B_MTP_ASSISTANT)
 
 test: ## Run repo tests
 	go test ./cmd/...
@@ -95,6 +110,34 @@ EXTRA_BENCH_ARGS += \
 	-antfly-latest "$(ANTFLY_LATEST_BIN)" \
 	-antfly-latest-dir "$(ANTFLY_SRC)"
 endif
+
+# QAT + MTP settings: single cooled canonical samples per engine and token count.
+BENCH_QAT_TOKEN_COUNTS       ?= 128,256
+BENCH_QAT_COOLDOWN_SECONDS   ?= 60
+BENCH_QAT_RUN_TIMEOUT        ?= 600
+BENCH_QAT_SPECULATIVE_K      ?= 2
+BENCH_QAT_SPECULATION_POLICY ?= force
+
+# No `build` dependency: this target benchmarks pinned antfly binaries
+# (ANTFLY_STABLE_BIN / EXTRA_BENCH_ARGS) and must not trigger a zig build.
+bench-gemma4-e4b-qat-mtp: ## Cooled single-sample Gemma 4 E4B QAT + MTP bench vs llama.cpp
+	go run ./cmd/bench \
+		-model "$(GEMMA4_E4B_QAT_PATH)" \
+		-model-dir "$(MODELS_DIR)/$(GEMMA4_E4B_QAT_REPO)" \
+		-llama-cli "$(LLAMA_CLI)" \
+		-prompt "$(BENCH_PROMPT)" \
+		-token-counts "$(BENCH_QAT_TOKEN_COUNTS)" \
+		-cooldown-seconds $(BENCH_QAT_COOLDOWN_SECONDS) \
+		-run-timeout-seconds $(BENCH_QAT_RUN_TIMEOUT) \
+		-ignore-eos \
+		-backend-budget-mb $(GEMMA4_E4B_BUDGET_MB) \
+		-antfly-draft-model "$(GEMMA4_E4B_MTP_ASSISTANT_DIR)" \
+		-antfly-speculative-k $(BENCH_QAT_SPECULATIVE_K) \
+		-antfly-speculation-policy $(BENCH_QAT_SPECULATION_POLICY) \
+		-output results/gemma4-e4b-qat-mtp.md \
+		$(EXTRA_BENCH_ARGS)
+	@echo ""
+	@cat results/gemma4-e4b-qat-mtp.md
 
 bench-gemma4-e4b: build ## Bench llama.cpp + antfly variants on Gemma 4 E4B
 	go run ./cmd/bench \

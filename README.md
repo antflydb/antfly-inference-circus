@@ -31,6 +31,30 @@ before building, so the binary always tracks canonical `antflydb/antfly` HEAD.
 If `antfly/` isn't present, the latest variant is skipped; `make bench` will
 still run llama.cpp and the brew stable.
 
+## Gemma 4 QAT + MTP cooled benchmark
+
+`make bench-gemma4-e4b-qat-mtp` compares llama.cpp and Antfly on Google's
+quantization-aware `gemma-4-E4B-it-qat-q4_0-gguf` checkpoint with Gemma 4
+multi-token prediction (MTP) enabled on the Antfly rows via the
+`google/gemma-4-E4B-it-assistant` drafter. It takes single cooled canonical
+samples: one run per engine per token count (default `128,256`), each preceded
+by a cooldown sleep (default 60 s), with `--ignore-eos` so every run generates
+the full token budget. Antfly rows read `--json-timing` output for the
+decode tok/s and prefill split (the speculative path does not print
+`first_token_ms`), and the report's `MTP` column records whether the run
+reported `mtp_enabled=true`.
+
+Prerequisites:
+
+```bash
+make download-gemma4-e4b-qat            # ~5 GB QAT q4_0 GGUF
+make download-gemma4-e4b-mtp-assistant  # ~200 MB safetensors drafter
+```
+
+Unlike the other bench targets it does not depend on `build`; it benchmarks
+the binaries you point it at (`ANTFLY_STABLE_BIN`, or the latest binary when
+`./antfly` exists) so it can baseline a pinned release without a zig build.
+
 ## Overriding paths
 
 The two antfly binaries can be overridden:

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -31,11 +32,24 @@ var (
 	prompt          = flag.String("prompt", "Explain what a compiler does in two sentences.", "Prompt")
 	promptFile      = flag.String("prompt-file", "", "Path to newline-delimited prompts")
 	maxTokens       = flag.Int("n", 32, "Max tokens to generate")
+	tokenCounts     = flag.String("token-counts", "", "Comma-separated max-token values benchmarked per engine; overrides -n when set")
 	output          = flag.String("output", "results/gemma4-e4b.md", "Output markdown file")
 	backendBudgetMB = flag.Int("backend-budget-mb", 20480, "Antfly --backend-budget-mb value")
+
+	cooldownSeconds   = flag.Int("cooldown-seconds", 0, "Sleep this long before each measured run so samples start from a cooled, quiet host")
+	runTimeoutSeconds = flag.Int("run-timeout-seconds", 120, "Per-run timeout in seconds")
+	ignoreEOS         = flag.Bool("ignore-eos", false, "Keep generating past EOS so every run emits exactly the requested token count")
+
+	antflyDraftModel        = flag.String("antfly-draft-model", "", "Gemma 4 MTP assistant model dir; enables speculative decoding on Antfly rows")
+	antflySpeculativeK      = flag.Int("antfly-speculative-k", 2, "Antfly --speculative-k when a draft model is set")
+	antflySpeculationPolicy = flag.String("antfly-speculation-policy", "force", "Antfly --speculation-policy when a draft model is set")
 )
 
-const promptPlaceholder = "__BENCH_PROMPT__"
+const (
+	promptPlaceholder     = "__BENCH_PROMPT__"
+	tokensPlaceholder     = "__BENCH_TOKENS__"
+	timingJSONPlaceholder = "__BENCH_TIMING_JSON__"
+)
 
 type benchConfig struct {
 	Name   string
@@ -60,11 +74,13 @@ type benchResult struct {
 
 type benchSummary struct {
 	Config    benchConfig
+	MaxTokens int
 	GenTPS    float64
 	PrefillMs float64
 	PeakRSSMB float64
 	WallSec   float64
 	TokensGen int
+	MTP       string
 	RawOutput string
 	Error     string
 }
@@ -90,6 +106,14 @@ func generateSubcommand(bin string) []string {
 // reGenerateSubcmd matches a line listing `generate` as a subcommand — e.g.
 // "  generate    Run text generation" (cobra) or "  generate" (zig CLI).
 var reGenerateSubcmd = regexp.MustCompile(`(?m)^\s+generate(\s|$)`)
+
+// supportsJSONTiming reports whether `inference generate` accepts --json-timing.
+// The speculative/MTP path omits the first_token_ms stdout line, so the JSON
+// timing file is the only reliable prefill/decode split there.
+func supportsJSONTiming(bin string) bool {
+	out, _ := exec.Command(bin, "inference", "generate", "--help").CombinedOutput()
+	return bytes.Contains(out, []byte("--json-timing"))
+}
 
 func gitHash(dir string) string {
 	if dir == "" {
@@ -123,23 +147,61 @@ func loadPrompts() ([]string, error) {
 	return prompts, nil
 }
 
-func argsForPrompt(args []string, prompt string) []string {
+func argsForRun(args []string, prompt string, nTokens int, timingJSON string) []string {
 	resolved := make([]string, len(args))
 	for i, arg := range args {
-		if arg == promptPlaceholder {
+		switch arg {
+		case promptPlaceholder:
 			resolved[i] = prompt
-			continue
+		case tokensPlaceholder:
+			resolved[i] = strconv.Itoa(nTokens)
+		case timingJSONPlaceholder:
+			resolved[i] = timingJSON
+		default:
+			resolved[i] = arg
 		}
-		resolved[i] = arg
 	}
 	return resolved
 }
 
-func summarizeRuns(cfg benchConfig, runs []benchResult) benchSummary {
-	summary := benchSummary{Config: cfg}
+func parseTokenCounts() ([]int, error) {
+	if strings.TrimSpace(*tokenCounts) == "" {
+		return []int{*maxTokens}, nil
+	}
+	var counts []int
+	for _, field := range strings.Split(*tokenCounts, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		n, err := strconv.Atoi(field)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("invalid -token-counts entry %q", field)
+		}
+		counts = append(counts, n)
+	}
+	if len(counts) == 0 {
+		return nil, fmt.Errorf("no token counts found in %q", *tokenCounts)
+	}
+	return counts, nil
+}
+
+func summarizeRuns(cfg benchConfig, nTokens int, runs []benchResult) benchSummary {
+	summary := benchSummary{Config: cfg, MaxTokens: nTokens, MTP: "-"}
 	if len(runs) == 0 {
 		summary.Error = "no benchmark runs"
 		return summary
+	}
+
+	isAntfly := !strings.Contains(cfg.Name, "llama")
+	if isAntfly && *antflyDraftModel != "" && cfg.Args != nil {
+		summary.MTP = "off"
+		for _, run := range runs {
+			if run.Error == "" && reAntflyMTPEnabled.MatchString(run.RawOutput) {
+				summary.MTP = "on"
+				break
+			}
+		}
 	}
 
 	var genSum, prefillSum, peakSum, wallSum float64
@@ -205,26 +267,46 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error loading prompts: %v\n", err)
 		os.Exit(1)
 	}
-
-	n := strconv.Itoa(*maxTokens)
+	tokenList, err := parseTokenCounts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	llamaBase := []string{
-		"-m", *modelGGUF, "-p", promptPlaceholder, "-n", n,
+		"-m", *modelGGUF, "-p", promptPlaceholder, "-n", tokensPlaceholder,
 		"--temp", "0", "--no-display-prompt", "--perf",
 		"--single-turn", "--reasoning-format", "none",
 	}
+	if *ignoreEOS {
+		llamaBase = append(llamaBase, "--ignore-eos")
+	}
 
-	antflyInferenceArgs := func(prefix []string) []string {
+	antflyInferenceArgs := func(prefix []string, jsonTiming bool) []string {
 		args := append([]string{}, prefix...)
-		return append(args,
+		args = append(args,
 			*modelDir, promptPlaceholder,
-			"--backend", "metal", "--max-tokens", n,
+			"--backend", "metal", "--max-tokens", tokensPlaceholder,
 			"--host-budget-mb", strconv.Itoa(*backendBudgetMB),
 			"--backend-budget-mb", strconv.Itoa(*backendBudgetMB),
 			"--combined-budget-mb", strconv.Itoa(*backendBudgetMB),
 			"--temperature", "0",
 			"--print-timing", "--print-token-count", "--print-finish-reason",
 		)
+		if jsonTiming {
+			args = append(args, "--json-timing", timingJSONPlaceholder)
+		}
+		if *ignoreEOS {
+			args = append(args, "--ignore-eos")
+		}
+		if *antflyDraftModel != "" {
+			args = append(args,
+				"--draft-model", *antflyDraftModel,
+				"--speculative-k", strconv.Itoa(*antflySpeculativeK),
+				"--speculation-policy", *antflySpeculationPolicy,
+			)
+		}
+		return args
 	}
 
 	var configs []benchConfig
@@ -249,7 +331,7 @@ func main() {
 			Commit: gitHash(*antflyStableDir),
 		}
 		if prefix := generateSubcommand(*antflyStableBin); prefix != nil {
-			cfg.Args = antflyInferenceArgs(prefix)
+			cfg.Args = antflyInferenceArgs(prefix, supportsJSONTiming(*antflyStableBin))
 		}
 		configs = append(configs, cfg)
 	}
@@ -262,56 +344,66 @@ func main() {
 			Commit: gitHash(*antflyLatestDir),
 		}
 		if prefix := generateSubcommand(*antflyLatestBin); prefix != nil {
-			cfg.Args = antflyInferenceArgs(prefix)
+			cfg.Args = antflyInferenceArgs(prefix, supportsJSONTiming(*antflyLatestBin))
 		}
 		configs = append(configs, cfg)
 	}
 
 	var results []benchSummary
 	for _, cfg := range configs {
-		var runs []benchResult
-		for idx, benchPrompt := range prompts {
-			fmt.Fprintf(os.Stderr, "running: %s", cfg.Name)
-			if cfg.Commit != "" {
-				fmt.Fprintf(os.Stderr, " (%s)", cfg.Commit)
-			}
-			fmt.Fprintf(os.Stderr, " [prompt %d/%d] ...\n", idx+1, len(prompts))
-
-			var r benchResult
-			if cfg.Args == nil {
-				r = benchResult{
-					Config: cfg,
-					Prompt: benchPrompt,
-					Error:  "no compatible `inference generate` subcommand; GGUF benchmark not supported by this build",
+		for _, nTokens := range tokenList {
+			var runs []benchResult
+			for idx, benchPrompt := range prompts {
+				if *cooldownSeconds > 0 && cfg.Args != nil {
+					fmt.Fprintf(os.Stderr, "cooldown: %ds before %s (n=%d)\n", *cooldownSeconds, cfg.Name, nTokens)
+					time.Sleep(time.Duration(*cooldownSeconds) * time.Second)
 				}
-			} else {
-				promptCfg := cfg
-				promptCfg.Args = argsForPrompt(cfg.Args, benchPrompt)
-				r = runBench(promptCfg)
-				r.Config = cfg
-				r.Prompt = benchPrompt
-			}
+				fmt.Fprintf(os.Stderr, "running: %s", cfg.Name)
+				if cfg.Commit != "" {
+					fmt.Fprintf(os.Stderr, " (%s)", cfg.Commit)
+				}
+				fmt.Fprintf(os.Stderr, " [n=%d, prompt %d/%d] ...\n", nTokens, idx+1, len(prompts))
 
-			if r.Error != "" {
-				fmt.Fprintf(os.Stderr, "  ERROR: %s\n", r.Error)
-			} else {
-				fmt.Fprintf(os.Stderr, "  gen: %.1f tok/s | prefill: %.0fms | RSS: %.0f MB | wall: %.1fs\n",
-					r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec)
+				var r benchResult
+				if cfg.Args == nil {
+					r = benchResult{
+						Config: cfg,
+						Prompt: benchPrompt,
+						Error:  "no compatible `inference generate` subcommand; GGUF benchmark not supported by this build",
+					}
+				} else {
+					timingJSON := filepath.Join(os.TempDir(),
+						fmt.Sprintf("antfly-bench-timing-%d-%d-%d.json", os.Getpid(), nTokens, idx))
+					os.Remove(timingJSON)
+					promptCfg := cfg
+					promptCfg.Args = argsForRun(cfg.Args, benchPrompt, nTokens, timingJSON)
+					r = runBench(promptCfg, nTokens, timingJSON)
+					os.Remove(timingJSON)
+					r.Config = cfg
+					r.Prompt = benchPrompt
+				}
+
+				if r.Error != "" {
+					fmt.Fprintf(os.Stderr, "  ERROR: %s\n", r.Error)
+				} else {
+					fmt.Fprintf(os.Stderr, "  gen: %.1f tok/s | prefill: %.0fms | RSS: %.0f MB | wall: %.1fs\n",
+						r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec)
+				}
+				runs = append(runs, r)
 			}
-			runs = append(runs, r)
+			results = append(results, summarizeRuns(cfg, nTokens, runs))
 		}
-		results = append(results, summarizeRuns(cfg, runs))
 	}
 
-	if err := writeMarkdown(results, prompts); err != nil {
+	if err := writeMarkdown(results, prompts, tokenList); err != nil {
 		fmt.Fprintf(os.Stderr, "error writing output: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", *output)
 }
 
-func runBench(cfg benchConfig) benchResult {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*runTimeoutSeconds)*time.Second)
 	defer cancel()
 
 	var cmd *exec.Cmd
@@ -354,8 +446,9 @@ func runBench(cfg benchConfig) benchResult {
 		}
 		if !strings.Contains(cfg.Name, "llama") && antflyInferenceRunCompleted(raw) {
 			r.Error = ""
-			r.TokensGen = *maxTokens
+			r.TokensGen = nTokens
 			parseAntflyInference(&r)
+			applyAntflyJSONTiming(&r, timingJSON)
 		}
 		return r
 	}
@@ -365,15 +458,55 @@ func runBench(cfg benchConfig) benchResult {
 		RawOutput: raw,
 		WallSec:   wall.Seconds(),
 		PeakRSSMB: float64(peakRSSKB) / 1024,
-		TokensGen: *maxTokens,
+		TokensGen: nTokens,
 	}
 
 	if strings.Contains(cfg.Name, "llama") {
 		parseLlama(&r)
 	} else {
 		parseAntflyInference(&r)
+		applyAntflyJSONTiming(&r, timingJSON)
 	}
 	return r
+}
+
+// antflyJSONTiming mirrors the fields we need from `--json-timing` output.
+// It is authoritative over the stdout regexes: the speculative/MTP path does
+// not print first_token_ms, so JSON is the only prefill/decode split there.
+type antflyJSONTiming struct {
+	Tokens        int     `json:"tokens"`
+	DecodeTokPerS float64 `json:"decode_tok_per_s"`
+	TimingMs      struct {
+		PrefillInner float64 `json:"prefill_inner"`
+		DecodeInner  float64 `json:"decode_inner"`
+		Total        float64 `json:"total"`
+	} `json:"timing_ms"`
+}
+
+func applyAntflyJSONTiming(r *benchResult, path string) {
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var t antflyJSONTiming
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return
+	}
+	if t.Tokens > 0 {
+		r.TokensGen = t.Tokens
+	}
+	if t.DecodeTokPerS > 0 {
+		r.GenTPS = t.DecodeTokPerS
+	}
+	if t.TimingMs.PrefillInner > 0 {
+		r.PrefillMs = t.TimingMs.PrefillInner
+	}
+	if t.TimingMs.Total > 0 {
+		r.WallSec = t.TimingMs.Total / 1000
+	}
 }
 
 // ─── Parsers ─────────────────────────────────────────────────────
@@ -384,6 +517,7 @@ var (
 	reAntflyFirstToken = regexp.MustCompile(`first_token_ms:.*?prefill=(\d+)`)
 	reAntflyTotal      = regexp.MustCompile(`timing_ms:.*?total=(\d+)`)
 	reAntflyTokens     = regexp.MustCompile(`tokens=(\d+)`)
+	reAntflyMTPEnabled = regexp.MustCompile(`(?m)^speculative: .*mtp_enabled=true`)
 	reLlamaPerf        = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
 	reANSI             = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 )
@@ -505,7 +639,7 @@ func maxTreeRSS(pid int) int64 {
 
 // ─── Markdown output ─────────────────────────────────────────────
 
-func writeMarkdown(results []benchSummary, prompts []string) error {
+func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) error {
 	var b strings.Builder
 
 	modelName := filepath.Base(filepath.Dir(*modelGGUF)) + "/" + filepath.Base(*modelGGUF)
@@ -520,7 +654,22 @@ func writeMarkdown(results []benchSummary, prompts []string) error {
 	} else {
 		b.WriteString(fmt.Sprintf("**Prompts:** %d nightly bug questions  \n", len(prompts)))
 	}
-	b.WriteString(fmt.Sprintf("**Max tokens:** %d  \n\n", *maxTokens))
+	tokenStrs := make([]string, len(tokenList))
+	for i, n := range tokenList {
+		tokenStrs[i] = strconv.Itoa(n)
+	}
+	b.WriteString(fmt.Sprintf("**Max tokens:** %s  \n", strings.Join(tokenStrs, ", ")))
+	if *cooldownSeconds > 0 {
+		b.WriteString(fmt.Sprintf("**Cooldown:** %ds before each measured run (single cooled samples)  \n", *cooldownSeconds))
+	}
+	if *ignoreEOS {
+		b.WriteString("**Ignore EOS:** generation continues to the full token budget on both engines  \n")
+	}
+	if *antflyDraftModel != "" {
+		b.WriteString(fmt.Sprintf("**MTP:** draft model `%s`, speculative-k %d, speculation-policy %s  \n",
+			filepath.Base(*antflyDraftModel), *antflySpeculativeK, *antflySpeculationPolicy))
+	}
+	b.WriteString("\n")
 
 	if len(prompts) > 1 {
 		for i, benchPrompt := range prompts {
@@ -544,21 +693,25 @@ func writeMarkdown(results []benchSummary, prompts []string) error {
 	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals\n\n")
 
 	// Table
-	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak RSS (MB) | Wall (s) | Tokens |\n")
-	b.WriteString("|--------|-------------|--------------|---------------|----------|--------|\n")
+	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak RSS (MB) | Wall (s) | Tokens | MTP |\n")
+	b.WriteString("|--------|-------------|--------------|---------------|----------|--------|-----|\n")
 	for _, r := range results {
 		if r.Error != "" {
-			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — |\n", r.Config.Name))
+			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — | %s |\n", r.Config.Name, r.MTP))
 			continue
 		}
-		b.WriteString(fmt.Sprintf("| %s | %.1f | %.0f | %.0f | %.1f | %d |\n",
-			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec, r.TokensGen))
+		b.WriteString(fmt.Sprintf("| %s | %.3f | %.0f | %.0f | %.1f | %d | %s |\n",
+			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WallSec, r.TokensGen, r.MTP))
 	}
 	b.WriteString("\n")
 
 	// Per-run spoiler blocks
 	for _, r := range results {
-		b.WriteString(fmt.Sprintf("```spoiler %s\n", r.Config.Name))
+		label := r.Config.Name
+		if len(tokenList) > 1 {
+			label = fmt.Sprintf("%s (n=%d)", r.Config.Name, r.MaxTokens)
+		}
+		b.WriteString(fmt.Sprintf("```spoiler %s\n", label))
 		if r.Error != "" {
 			b.WriteString(fmt.Sprintf("ERROR: %s\n", r.Error))
 		}
