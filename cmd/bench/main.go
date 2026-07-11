@@ -584,7 +584,7 @@ func pollRSS(pid int, peakKB *int64, done <-chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
-			rss := maxTreeRSS(pid)
+			rss := sumTreeRSS(pid)
 			for {
 				old := atomic.LoadInt64(peakKB)
 				if rss <= old || atomic.CompareAndSwapInt64(peakKB, old, rss) {
@@ -595,7 +595,7 @@ func pollRSS(pid int, peakKB *int64, done <-chan struct{}) {
 	}
 }
 
-func maxTreeRSS(pid int) int64 {
+func sumTreeRSS(pid int) int64 {
 	out, err := exec.Command("ps", "-eo", "pid,ppid,rss").Output()
 	if err != nil {
 		return 0
@@ -628,13 +628,13 @@ func maxTreeRSS(pid int) int64 {
 			}
 		}
 	}
-	var maxRSS int64
+	var sumRSS int64
 	for _, p := range procs {
-		if tree[p.pid] && p.rss > maxRSS {
-			maxRSS = p.rss
+		if tree[p.pid] {
+			sumRSS += p.rss
 		}
 	}
-	return maxRSS
+	return sumRSS
 }
 
 // ─── Markdown output ─────────────────────────────────────────────
@@ -690,7 +690,7 @@ func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) er
 	b.WriteString("**Notes:**\n")
 	b.WriteString("- Prefill (ms) for llama.cpp = wall time minus generation time (includes model load)\n")
 	b.WriteString("- Prefill (ms) for Antfly inference = reported prefill time (excludes model load)\n")
-	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals\n\n")
+	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals, summed across the benchmarked process tree (client + spawned backends)\n\n")
 
 	// Table
 	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak RSS (MB) | Wall (s) | Tokens | MTP |\n")
