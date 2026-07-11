@@ -755,19 +755,25 @@ func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) er
 	b.WriteString("**Notes:**\n")
 	b.WriteString("- Prefill (ms) for llama.cpp = wall time minus generation time (includes model load)\n")
 	b.WriteString("- Prefill (ms) for Antfly inference = reported prefill time (excludes model load)\n")
-	b.WriteString("- Peak RSS measured via `ps` polling at 200ms intervals, summed across the benchmarked process tree (client + spawned backends)\n")
-	b.WriteString("- Wired Δ is the peak growth of system-wide wired memory over a pre-launch baseline, polled at 200ms intervals; it captures Metal/IOKit model buffers that macOS charges to the system instead of the process. Requires a quiet host.\n\n")
+	b.WriteString("- Peak Mem = process-tree RSS (via `ps` polling at 200ms intervals, summed across client + spawned backends) plus the peak growth of system-wide wired memory over a pre-launch baseline. The wired component captures Metal/IOKit model buffers that macOS charges to the system instead of the process; it requires a quiet host. Per-engine breakdown below the table.\n\n")
 
 	// Table
-	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak RSS (MB) | Wired Δ (MB) | Wall (s) | Tokens | MTP |\n")
-	b.WriteString("|--------|-------------|--------------|---------------|--------------|----------|--------|-----|\n")
+	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak Mem (MB) | Wall (s) | Tokens | MTP |\n")
+	b.WriteString("|--------|-------------|--------------|---------------|----------|--------|-----|\n")
 	for _, r := range results {
 		if r.Error != "" {
-			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — | — | %s |\n", r.Config.Name, r.MTP))
+			b.WriteString(fmt.Sprintf("| %s | — | — | — | — | — | %s |\n", r.Config.Name, r.MTP))
 			continue
 		}
-		b.WriteString(fmt.Sprintf("| %s | %.3f | %.0f | %.0f | %.0f | %.1f | %d | %s |\n",
-			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB, r.WiredDeltaMB, r.WallSec, r.TokensGen, r.MTP))
+		b.WriteString(fmt.Sprintf("| %s | %.3f | %.0f | %.0f | %.1f | %d | %s |\n",
+			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB+r.WiredDeltaMB, r.WallSec, r.TokensGen, r.MTP))
+	}
+	b.WriteString("\nMemory breakdown (process-tree RSS + wired Δ, MB):\n")
+	for _, r := range results {
+		if r.Error != "" {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("- %s: %.0f + %.0f\n", r.Config.Name, r.PeakRSSMB, r.WiredDeltaMB))
 	}
 	b.WriteString("\n")
 
