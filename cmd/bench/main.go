@@ -60,31 +60,32 @@ type benchConfig struct {
 }
 
 type benchResult struct {
-	Config       benchConfig
-	Prompt       string
-	GenTPS       float64
-	PromptTPS    float64
-	PrefillMs    float64
-	PeakRSSMB    float64
-	WiredDeltaMB float64
-	WallSec      float64
-	TokensGen    int
-	RawOutput    string
-	Error        string
+	Config           benchConfig
+	Prompt           string
+	GenTPS           float64
+	PromptTPS        float64
+	PrefillMs        float64
+	PeakRSSMB        float64
+	SysDemandDeltaMB float64
+	WallSec          float64
+	TokensGen        int
+	RawOutput        string
+	Error            string
 }
 
 type benchSummary struct {
-	Config       benchConfig
-	MaxTokens    int
-	GenTPS       float64
-	PrefillMs    float64
-	PeakRSSMB    float64
-	WiredDeltaMB float64
-	WallSec      float64
-	TokensGen    int
-	MTP          string
-	RawOutput    string
-	Error        string
+	Config           benchConfig
+	MaxTokens        int
+	GenTPS           float64
+	PrefillMs        float64
+	PeakRSSMB        float64
+	SysDemandDeltaMB float64
+	PeakMemMB        float64
+	WallSec          float64
+	TokensGen        int
+	MTP              string
+	RawOutput        string
+	Error            string
 }
 
 func fileExists(path string) bool {
@@ -206,7 +207,7 @@ func summarizeRuns(cfg benchConfig, nTokens int, runs []benchResult) benchSummar
 		}
 	}
 
-	var genSum, prefillSum, peakSum, wiredSum, wallSum float64
+	var genSum, prefillSum, peakSum, sysDemandSum, peakMemSum, wallSum float64
 	var successCount int
 	var raw strings.Builder
 
@@ -232,7 +233,13 @@ func summarizeRuns(cfg benchConfig, nTokens int, runs []benchResult) benchSummar
 		genSum += run.GenTPS
 		prefillSum += run.PrefillMs
 		peakSum += run.PeakRSSMB
-		wiredSum += run.WiredDeltaMB
+		sysDemandSum += run.SysDemandDeltaMB
+		// The model weights appear in exactly one of the two views: file-backed
+		// resident pages (process RSS) for CPU mmap engines, or wired Metal/IOKit
+		// buffers (system demand growth) for GPU engines. Taking the max counts
+		// them once for every engine; summing would double-count engines whose
+		// mapped weights get wired for the GPU.
+		peakMemSum += max(run.PeakRSSMB, run.SysDemandDeltaMB)
 		wallSum += run.WallSec
 		summary.TokensGen += run.TokensGen
 	}
@@ -246,7 +253,8 @@ func summarizeRuns(cfg benchConfig, nTokens int, runs []benchResult) benchSummar
 	summary.GenTPS = genSum / float64(successCount)
 	summary.PrefillMs = prefillSum / float64(successCount)
 	summary.PeakRSSMB = peakSum / float64(successCount)
-	summary.WiredDeltaMB = wiredSum / float64(successCount)
+	summary.SysDemandDeltaMB = sysDemandSum / float64(successCount)
+	summary.PeakMemMB = peakMemSum / float64(successCount)
 	summary.WallSec = wallSum / float64(successCount)
 	summary.TokensGen /= successCount
 	return summary
@@ -423,16 +431,16 @@ func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
 
-	baselineWiredKB := wiredKB()
+	baselineSysDemandKB := sysDemandKB()
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		return benchResult{Config: cfg, Error: fmt.Sprintf("start: %v", err)}
 	}
 
-	var peakRSSKB, peakWiredDeltaKB int64
+	var peakRSSKB, peakSysDemandDeltaKB int64
 	done := make(chan struct{})
 	go pollRSS(cmd.Process.Pid, &peakRSSKB, done)
-	go pollWiredDelta(baselineWiredKB, &peakWiredDeltaKB, done)
+	go pollSysDemandDelta(baselineSysDemandKB, &peakSysDemandDeltaKB, done)
 
 	err := cmd.Wait()
 	close(done)
@@ -449,7 +457,7 @@ func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
 			Config: cfg, RawOutput: raw,
 			Error:   fmt.Sprintf("exit: %v", err),
 			WallSec: wall.Seconds(), PeakRSSMB: float64(peakRSSKB) / 1024,
-			WiredDeltaMB: float64(peakWiredDeltaKB) / 1024,
+			SysDemandDeltaMB: float64(peakSysDemandDeltaKB) / 1024,
 		}
 		if !strings.Contains(cfg.Name, "llama") && antflyInferenceRunCompleted(raw) {
 			r.Error = ""
@@ -461,12 +469,12 @@ func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
 	}
 
 	r := benchResult{
-		Config:       cfg,
-		RawOutput:    raw,
-		WallSec:      wall.Seconds(),
-		PeakRSSMB:    float64(peakRSSKB) / 1024,
-		WiredDeltaMB: float64(peakWiredDeltaKB) / 1024,
-		TokensGen:    nTokens,
+		Config:           cfg,
+		RawOutput:        raw,
+		WallSec:          wall.Seconds(),
+		PeakRSSMB:        float64(peakRSSKB) / 1024,
+		SysDemandDeltaMB: float64(peakSysDemandDeltaKB) / 1024,
+		TokensGen:        nTokens,
 	}
 
 	if strings.Contains(cfg.Name, "llama") {
@@ -603,12 +611,14 @@ func pollRSS(pid int, peakKB *int64, done <-chan struct{}) {
 	}
 }
 
-// pollWiredDelta tracks the peak growth of system-wide wired memory over a
-// baseline taken just before the benchmarked process starts. Metal/IOKit
-// buffers (where GPU engines keep model weights) are wired and charged to
-// the system rather than the allocating task, so process RSS misses them.
+// pollSysDemandDelta tracks the peak growth of system-wide memory demand —
+// anonymous pages + compressor-occupied pages + wired pages — over a baseline
+// taken just before the benchmarked process starts. Wired Metal/IOKit buffers
+// (where GPU engines keep model weights) are charged to the system rather
+// than the allocating task, so process RSS misses them; anonymous and
+// compressor growth keep KV/runtime memory visible on the same yardstick.
 // Requires a quiet host; the per-run cooldown keeps this usable.
-func pollWiredDelta(baselineKB int64, peakDeltaKB *int64, done <-chan struct{}) {
+func pollSysDemandDelta(baselineKB int64, peakDeltaKB *int64, done <-chan struct{}) {
 	if baselineKB <= 0 {
 		return
 	}
@@ -619,7 +629,7 @@ func pollWiredDelta(baselineKB int64, peakDeltaKB *int64, done <-chan struct{}) 
 		case <-done:
 			return
 		case <-ticker.C:
-			delta := wiredKB() - baselineKB
+			delta := sysDemandKB() - baselineKB
 			if delta <= 0 {
 				continue
 			}
@@ -634,11 +644,15 @@ func pollWiredDelta(baselineKB int64, peakDeltaKB *int64, done <-chan struct{}) 
 }
 
 var (
-	reVMStatPageSize = regexp.MustCompile(`page size of (\d+) bytes`)
-	reVMStatWired    = regexp.MustCompile(`Pages wired down:\s+(\d+)\.`)
+	reVMStatPageSize   = regexp.MustCompile(`page size of (\d+) bytes`)
+	reVMStatWired      = regexp.MustCompile(`Pages wired down:\s+(\d+)\.`)
+	reVMStatAnonymous  = regexp.MustCompile(`Anonymous pages:\s+(\d+)\.`)
+	reVMStatCompressor = regexp.MustCompile(`Pages occupied by compressor:\s+(\d+)\.`)
 )
 
-func wiredKB() int64 {
+// sysDemandKB returns system-wide anonymous + compressor-occupied + wired
+// memory in KB. One vm_stat snapshot so the three counters are consistent.
+func sysDemandKB() int64 {
 	out, err := exec.Command("vm_stat").Output()
 	if err != nil {
 		return 0
@@ -649,15 +663,19 @@ func wiredKB() int64 {
 			pageSize = n
 		}
 	}
-	m := reVMStatWired.FindSubmatch(out)
-	if m == nil {
-		return 0
+	var totalPages int64
+	for _, re := range []*regexp.Regexp{reVMStatWired, reVMStatAnonymous, reVMStatCompressor} {
+		m := re.FindSubmatch(out)
+		if m == nil {
+			return 0
+		}
+		pages, err := strconv.ParseInt(string(m[1]), 10, 64)
+		if err != nil {
+			return 0
+		}
+		totalPages += pages
 	}
-	pages, err := strconv.ParseInt(string(m[1]), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return pages * pageSize / 1024
+	return totalPages * pageSize / 1024
 }
 
 func sumTreeRSS(pid int) int64 {
@@ -755,7 +773,7 @@ func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) er
 	b.WriteString("**Notes:**\n")
 	b.WriteString("- Prefill (ms) for llama.cpp = wall time minus generation time (includes model load)\n")
 	b.WriteString("- Prefill (ms) for Antfly inference = reported prefill time (excludes model load)\n")
-	b.WriteString("- Peak Mem = process-tree RSS (via `ps` polling at 200ms intervals, summed across client + spawned backends) plus the peak growth of system-wide wired memory over a pre-launch baseline. The wired component captures Metal/IOKit model buffers that macOS charges to the system instead of the process; it requires a quiet host. Per-engine breakdown below the table.\n\n")
+	b.WriteString("- Peak Mem = max of two views polled at 200ms: (a) process-tree RSS summed across client + spawned backends, and (b) growth of system-wide anonymous + compressor-occupied + wired memory over a pre-launch baseline. Model weights land in exactly one view — file-backed resident pages (RSS) when an engine mmaps them for the CPU, wired Metal/IOKit buffers (system growth) when they live on the GPU — so the max counts them once per engine without double counting. Requires a quiet host. Per-engine breakdown below the table.\n\n")
 
 	// Table
 	b.WriteString("| Engine | Gen (tok/s) | Prefill (ms) | Peak Mem (MB) | Wall (s) | Tokens | MTP |\n")
@@ -766,14 +784,15 @@ func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) er
 			continue
 		}
 		b.WriteString(fmt.Sprintf("| %s | %.3f | %.0f | %.0f | %.1f | %d | %s |\n",
-			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakRSSMB+r.WiredDeltaMB, r.WallSec, r.TokensGen, r.MTP))
+			r.Config.Name, r.GenTPS, r.PrefillMs, r.PeakMemMB, r.WallSec, r.TokensGen, r.MTP))
 	}
-	b.WriteString("\nMemory breakdown (process-tree RSS + wired Δ, MB):\n")
+	b.WriteString("\nMemory views (MB, reported Peak Mem is the max of the two):\n")
 	for _, r := range results {
 		if r.Error != "" {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("- %s: %.0f + %.0f\n", r.Config.Name, r.PeakRSSMB, r.WiredDeltaMB))
+		b.WriteString(fmt.Sprintf("- %s (n=%d): process-tree RSS %.0f, system demand Δ %.0f\n",
+			r.Config.Name, r.MaxTokens, r.PeakRSSMB, r.SysDemandDeltaMB))
 	}
 	b.WriteString("\n")
 
