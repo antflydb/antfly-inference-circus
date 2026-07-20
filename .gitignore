@@ -13,3 +13,6 @@
 
 # Nightly build artifacts
 /.nightly/
+
+# Local tool installs (vllm-metal venv, Modelfiles)
+/.tools/

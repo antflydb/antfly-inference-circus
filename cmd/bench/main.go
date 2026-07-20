@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -37,12 +40,23 @@ var (
 	backendBudgetMB = flag.Int("backend-budget-mb", 20480, "Antfly --backend-budget-mb value")
 
 	cooldownSeconds   = flag.Int("cooldown-seconds", 0, "Sleep this long before each measured run so samples start from a cooled, quiet host")
+	warmupTokens      = flag.Int("warmup-tokens", 0, "Run one discarded generation of this many tokens before each measured exec-engine sample (server engines warm up internally)")
 	runTimeoutSeconds = flag.Int("run-timeout-seconds", 120, "Per-run timeout in seconds")
 	ignoreEOS         = flag.Bool("ignore-eos", false, "Keep generating past EOS so every run emits exactly the requested token count")
 
 	antflyDraftModel        = flag.String("antfly-draft-model", "", "Gemma 4 MTP assistant model dir; enables speculative decoding on Antfly rows")
 	antflySpeculativeK      = flag.Int("antfly-speculative-k", 2, "Antfly --speculative-k when a draft model is set")
 	antflySpeculationPolicy = flag.String("antfly-speculation-policy", "force", "Antfly --speculation-policy when a draft model is set")
+
+	ollamaBin   = flag.String("ollama-bin", "ollama", "Path to ollama binary")
+	ollamaModel = flag.String("ollama-model", "", "Ollama model name (already imported); empty skips the Ollama row")
+	vllmBin     = flag.String("vllm-bin", "", "Path to vllm-metal server binary; empty skips the vLLM row")
+	vllmModel   = flag.String("vllm-model", "", "HuggingFace model name for vllm-metal (MLX format, not GGUF)")
+)
+
+const (
+	ollamaPort = "11435" // private port so a user-level ollama on 11434 is untouched
+	vllmPort   = "8199"
 )
 
 const (
@@ -57,6 +71,21 @@ type benchConfig struct {
 	Args   []string
 	UsePTY bool
 	Commit string // short git hash (for clean repos)
+	Server *serverEngine
+}
+
+// serverEngine describes an engine that serves generation over HTTP. The
+// bench spawns the server itself so the RSS poller sees the whole process
+// tree (server + any runner it forks), keeping memory on the same yardstick
+// as the exec-based engines.
+type serverEngine struct {
+	Kind      string // "ollama" | "openai"
+	Bin       string
+	ServeArgs []string
+	Env       []string
+	BaseURL   string
+	ReadyPath string
+	Model     string
 }
 
 type benchResult struct {
@@ -285,9 +314,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --verbose is required for the `prompt eval time = ... ms / N tokens`
+	// slot timing line, the only place llama-cli reports pure prefill
+	// (the [ Prompt: ... t/s ] bracket gives rates, not times).
 	llamaBase := []string{
 		"-m", *modelGGUF, "-p", promptPlaceholder, "-n", tokensPlaceholder,
-		"--temp", "0", "--no-display-prompt", "--perf",
+		"--temp", "0", "--no-display-prompt", "--perf", "--verbose",
 		"--single-turn", "--reasoning-format", "none",
 	}
 	if *ignoreEOS {
@@ -329,11 +361,37 @@ func main() {
 		Args: append(llamaBase, "-ngl", "99"), UsePTY: true,
 	})
 
-	// llama.cpp CPU
-	configs = append(configs, benchConfig{
-		Name: "llama.cpp (CPU)", Cmd: *llamaBin,
-		Args: append(append([]string{}, llamaBase...), "-ngl", "0"), UsePTY: true,
-	})
+	// Ollama, serving the same GGUF imported into its blob store.
+	if *ollamaModel != "" {
+		configs = append(configs, benchConfig{
+			Name: "ollama",
+			Server: &serverEngine{
+				Kind:      "ollama",
+				Bin:       *ollamaBin,
+				ServeArgs: []string{"serve"},
+				Env:       []string{"OLLAMA_HOST=127.0.0.1:" + ollamaPort},
+				BaseURL:   "http://127.0.0.1:" + ollamaPort,
+				ReadyPath: "/api/version",
+				Model:     *ollamaModel,
+			},
+		})
+	}
+
+	// vLLM (vllm-metal plugin). MLX model format — the nearest 4-bit quant,
+	// not the same GGUF bytes; the row label carries that caveat.
+	if *vllmBin != "" && *vllmModel != "" {
+		configs = append(configs, benchConfig{
+			Name: "vllm-metal (MLX 4-bit)",
+			Server: &serverEngine{
+				Kind:      "openai",
+				Bin:       *vllmBin,
+				ServeArgs: []string{"--model", *vllmModel, "--host", "127.0.0.1", "--port", vllmPort},
+				BaseURL:   "http://127.0.0.1:" + vllmPort,
+				ReadyPath: "/v1/models",
+				Model:     *vllmModel,
+			},
+		})
+	}
 
 	// antfly (brew stable) — probe for the Antfly 0.2 inference command shape.
 	if *antflyStableBin != "" && fileExists(*antflyStableBin) {
@@ -366,7 +424,20 @@ func main() {
 		for _, nTokens := range tokenList {
 			var runs []benchResult
 			for idx, benchPrompt := range prompts {
-				if *cooldownSeconds > 0 && cfg.Args != nil {
+				runnable := cfg.Args != nil || cfg.Server != nil
+				// Warm-up before the cooldown: it heats Metal shader caches and
+				// page cache so the measured sample reflects a warm engine, and
+				// the cooldown that follows still guarantees a quiet, cool host.
+				if *warmupTokens > 0 && cfg.Server == nil && cfg.Args != nil {
+					fmt.Fprintf(os.Stderr, "warmup: %d tokens for %s\n", *warmupTokens, cfg.Name)
+					warmCfg := cfg
+					warmJSON := filepath.Join(os.TempDir(),
+						fmt.Sprintf("antfly-bench-warm-%d-%d-%d.json", os.Getpid(), nTokens, idx))
+					warmCfg.Args = argsForRun(cfg.Args, benchPrompt, *warmupTokens, warmJSON)
+					runBench(warmCfg, *warmupTokens, warmJSON)
+					os.Remove(warmJSON)
+				}
+				if *cooldownSeconds > 0 && runnable {
 					fmt.Fprintf(os.Stderr, "cooldown: %ds before %s (n=%d)\n", *cooldownSeconds, cfg.Name, nTokens)
 					time.Sleep(time.Duration(*cooldownSeconds) * time.Second)
 				}
@@ -377,12 +448,16 @@ func main() {
 				fmt.Fprintf(os.Stderr, " [n=%d, prompt %d/%d] ...\n", nTokens, idx+1, len(prompts))
 
 				var r benchResult
-				if cfg.Args == nil {
+				if !runnable {
 					r = benchResult{
 						Config: cfg,
 						Prompt: benchPrompt,
 						Error:  "no compatible `inference generate` subcommand; GGUF benchmark not supported by this build",
 					}
+				} else if cfg.Server != nil {
+					r = runServerBench(cfg, nTokens, benchPrompt)
+					r.Config = cfg
+					r.Prompt = benchPrompt
 				} else {
 					timingJSON := filepath.Join(os.TempDir(),
 						fmt.Sprintf("antfly-bench-timing-%d-%d-%d.json", os.Getpid(), nTokens, idx))
@@ -451,6 +526,11 @@ func runBench(cfg benchConfig, nTokens int, timingJSON string) benchResult {
 	raw = reANSI.ReplaceAllString(raw, "")
 	raw = strings.ReplaceAll(raw, "\x04", "")
 	raw = strings.ReplaceAll(raw, "^D", "")
+	if cfg.UsePTY && len(raw) > 8000 {
+		// --verbose llama runs log per-token lines; keep the head (banner,
+		// generation text) and tail (perf/timing block) for the report.
+		raw = raw[:2000] + "\n...(verbose output truncated)...\n" + raw[len(raw)-6000:]
+	}
 
 	if err != nil {
 		r := benchResult{
@@ -525,6 +605,221 @@ func applyAntflyJSONTiming(r *benchResult, path string) {
 	}
 }
 
+// ─── Server-based engines (ollama, vllm-metal) ──────────────────
+
+// runServerBench spawns the engine's own server, measures its process tree
+// with the same RSS/system-demand pollers as exec engines, runs one
+// generation over HTTP, then tears the server down.
+func runServerBench(cfg benchConfig, nTokens int, prompt string) benchResult {
+	se := cfg.Server
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*runTimeoutSeconds)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, se.Bin, se.ServeArgs...)
+	cmd.Env = append(os.Environ(), se.Env...)
+	var serverLog bytes.Buffer
+	cmd.Stdout = &serverLog
+	cmd.Stderr = &serverLog
+
+	baselineSysDemandKB := sysDemandKB()
+	start := time.Now()
+	if err := cmd.Start(); err != nil {
+		return benchResult{Config: cfg, Error: fmt.Sprintf("start server: %v", err)}
+	}
+
+	var peakRSSKB, peakSysDemandDeltaKB int64
+	done := make(chan struct{})
+	go pollRSS(cmd.Process.Pid, &peakRSSKB, done)
+	go pollSysDemandDelta(baselineSysDemandKB, &peakSysDemandDeltaKB, done)
+
+	finish := func(r benchResult) benchResult {
+		cmd.Process.Signal(syscall.SIGTERM)
+		waited := make(chan struct{})
+		go func() { cmd.Wait(); close(waited) }()
+		select {
+		case <-waited:
+		case <-time.After(10 * time.Second):
+			cmd.Process.Kill()
+			<-waited
+		}
+		close(done)
+		r.PeakRSSMB = float64(atomic.LoadInt64(&peakRSSKB)) / 1024
+		r.SysDemandDeltaMB = float64(atomic.LoadInt64(&peakSysDemandDeltaKB)) / 1024
+		if r.WallSec == 0 {
+			r.WallSec = time.Since(start).Seconds()
+		}
+		logTail := serverLog.String()
+		if len(logTail) > 4000 {
+			logTail = logTail[len(logTail)-4000:]
+		}
+		if r.RawOutput != "" {
+			r.RawOutput += "\n"
+		}
+		r.RawOutput += "server log tail:\n" + strings.TrimSpace(logTail)
+		return r
+	}
+
+	if err := waitForReady(ctx, se.BaseURL+se.ReadyPath); err != nil {
+		return finish(benchResult{Error: fmt.Sprintf("server not ready: %v", err)})
+	}
+
+	switch se.Kind {
+	case "ollama":
+		return finish(ollamaGenerate(ctx, se, prompt, nTokens))
+	case "openai":
+		return finish(openaiGenerate(ctx, se, prompt, nTokens))
+	}
+	return finish(benchResult{Error: "unknown server engine kind: " + se.Kind})
+}
+
+func waitForReady(ctx context.Context, url string) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	for {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func ollamaGenerate(ctx context.Context, se *serverEngine, prompt string, nTokens int) benchResult {
+	payload := map[string]any{
+		"model": se.Model, "prompt": prompt, "stream": false,
+		"options": map[string]any{"num_predict": nTokens, "temperature": 0},
+	}
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(ctx, "POST", se.BaseURL+"/api/generate", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return benchResult{Error: fmt.Sprintf("ollama generate: %v", err)}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return benchResult{Error: fmt.Sprintf("ollama generate: HTTP %d: %s", resp.StatusCode, truncateBytes(raw))}
+	}
+	var out struct {
+		Response           string `json:"response"`
+		DoneReason         string `json:"done_reason"`
+		EvalCount          int    `json:"eval_count"`
+		EvalDuration       int64  `json:"eval_duration"`
+		PromptEvalDuration int64  `json:"prompt_eval_duration"`
+		LoadDuration       int64  `json:"load_duration"`
+		TotalDuration      int64  `json:"total_duration"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return benchResult{Error: fmt.Sprintf("ollama response parse: %v", err)}
+	}
+	r := benchResult{TokensGen: out.EvalCount}
+	if out.EvalDuration > 0 {
+		r.GenTPS = float64(out.EvalCount) / (float64(out.EvalDuration) / 1e9)
+	}
+	r.PrefillMs = float64(out.PromptEvalDuration) / 1e6
+	r.WallSec = float64(out.TotalDuration) / 1e9
+	r.RawOutput = fmt.Sprintf("done_reason=%s eval_count=%d eval_ms=%d prompt_eval_ms=%d load_ms=%d\n%s",
+		out.DoneReason, out.EvalCount, out.EvalDuration/1e6, out.PromptEvalDuration/1e6, out.LoadDuration/1e6,
+		strings.TrimSpace(out.Response))
+	return r
+}
+
+// openaiGenerate measures a non-streaming /v1/completions server with
+// nonce-prefixed probes: a discarded warm-up pays kernel compilation, then a
+// 1-token request bounds warm prefill, then the full request's extra wall
+// time over it is decode. Each request uses a distinct prompt prefix so the
+// server's prompt cache never serves a probe — all three pay one full,
+// same-length prefill. vllm-metal 0.1.0 ignores stream, ignore_eos, and
+// min_tokens, so generation may stop before nTokens; decode rate uses the
+// actual completion token count.
+func openaiGenerate(ctx context.Context, se *serverEngine, prompt string, nTokens int) benchResult {
+	if _, err := openaiCompletionOnce(ctx, se, "warm up pass one: "+prompt, 1); err != nil {
+		return benchResult{Error: fmt.Sprintf("vllm warm-up: %v", err)}
+	}
+	one, err := openaiCompletionOnce(ctx, se, "warm up pass two: "+prompt, 1)
+	if err != nil {
+		return benchResult{Error: fmt.Sprintf("vllm prefill probe: %v", err)}
+	}
+	full, err := openaiCompletionOnce(ctx, se, prompt, nTokens)
+	if err != nil {
+		return benchResult{Error: fmt.Sprintf("vllm completions: %v", err)}
+	}
+	r := benchResult{TokensGen: full.tokens}
+	decode := full.seconds - one.seconds
+	if full.tokens > 1 && decode > 0 {
+		r.GenTPS = float64(full.tokens-1) / decode
+	} else if full.tokens > 0 && full.seconds > 0 {
+		// Degenerate timing split; fall back to end-to-end rate.
+		r.GenTPS = float64(full.tokens) / full.seconds
+	}
+	r.PrefillMs = one.seconds * 1000
+	r.WallSec = full.seconds
+	r.RawOutput = fmt.Sprintf("completion_tokens=%d finish_reason=%s one_token_s=%.3f full_s=%.3f\n%s",
+		full.tokens, full.finishReason, one.seconds, full.seconds, strings.TrimSpace(full.text))
+	return r
+}
+
+type openaiCompletion struct {
+	tokens       int
+	seconds      float64
+	finishReason string
+	text         string
+}
+
+func openaiCompletionOnce(ctx context.Context, se *serverEngine, prompt string, maxTokens int) (openaiCompletion, error) {
+	payload := map[string]any{
+		"model": se.Model, "prompt": prompt,
+		"max_tokens": maxTokens, "temperature": 0,
+	}
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequestWithContext(ctx, "POST", se.BaseURL+"/v1/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return openaiCompletion{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	elapsed := time.Since(start).Seconds()
+	if resp.StatusCode != http.StatusOK {
+		return openaiCompletion{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateBytes(raw))
+	}
+	var out struct {
+		Choices []struct {
+			Text         string `json:"text"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return openaiCompletion{}, err
+	}
+	c := openaiCompletion{tokens: out.Usage.CompletionTokens, seconds: elapsed}
+	if len(out.Choices) > 0 {
+		c.text = out.Choices[0].Text
+		c.finishReason = out.Choices[0].FinishReason
+	}
+	return c, nil
+}
+
+func truncateBytes(b []byte) string {
+	s := string(b)
+	if len(s) > 500 {
+		s = s[:500]
+	}
+	return s
+}
+
 // ─── Parsers ─────────────────────────────────────────────────────
 
 var (
@@ -535,6 +830,7 @@ var (
 	reAntflyTokens     = regexp.MustCompile(`tokens=(\d+)`)
 	reAntflyMTPEnabled = regexp.MustCompile(`(?m)^speculative: .*mtp_enabled=true`)
 	reLlamaPerf        = regexp.MustCompile(`Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s`)
+	reLlamaPromptEval  = regexp.MustCompile(`prompt eval time =\s+([\d.]+) ms /\s+(\d+) tokens`)
 	reANSI             = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 )
 
@@ -580,12 +876,18 @@ func parseLlama(r *benchResult) {
 	if m := reLlamaPerf.FindStringSubmatch(r.RawOutput); m != nil {
 		r.PromptTPS, _ = strconv.ParseFloat(m[1], 64)
 		r.GenTPS, _ = strconv.ParseFloat(m[2], 64)
-		if r.GenTPS > 0 {
-			genSec := float64(r.TokensGen) / r.GenTPS
-			r.PrefillMs = (r.WallSec - genSec) * 1000
-			if r.PrefillMs < 0 {
-				r.PrefillMs = 0
-			}
+	}
+	if m := reLlamaPromptEval.FindStringSubmatch(r.RawOutput); m != nil {
+		// Pure prompt processing time, excluding model load — the
+		// comparable prefill number.
+		r.PrefillMs, _ = strconv.ParseFloat(m[1], 64)
+	} else if r.GenTPS > 0 {
+		// Old builds without the slot timing line: wall minus generation,
+		// which still includes model load.
+		genSec := float64(r.TokensGen) / r.GenTPS
+		r.PrefillMs = (r.WallSec - genSec) * 1000
+		if r.PrefillMs < 0 {
+			r.PrefillMs = 0
 		}
 	}
 }
@@ -745,6 +1047,9 @@ func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) er
 	if *cooldownSeconds > 0 {
 		b.WriteString(fmt.Sprintf("**Cooldown:** %ds before each measured run (single cooled samples)  \n", *cooldownSeconds))
 	}
+	if *warmupTokens > 0 {
+		b.WriteString(fmt.Sprintf("**Warm-up:** one discarded %d-token generation per exec engine before its cooldown; server engines warm up internally  \n", *warmupTokens))
+	}
 	if *ignoreEOS {
 		b.WriteString("**Ignore EOS:** generation continues to the full token budget on both engines  \n")
 	}
@@ -771,8 +1076,7 @@ func writeMarkdown(results []benchSummary, prompts []string, tokenList []int) er
 	b.WriteString("\n")
 
 	b.WriteString("**Notes:**\n")
-	b.WriteString("- Prefill (ms) for llama.cpp = wall time minus generation time (includes model load)\n")
-	b.WriteString("- Prefill (ms) for Antfly inference = reported prefill time (excludes model load)\n")
+	b.WriteString("- Prefill (ms) = warm prompt processing through first token, excluding model load, for every engine: llama.cpp from its verbose `prompt eval time` slot timing, Antfly from `--json-timing` prefill, ollama from `prompt_eval_duration`, vllm from a cache-busted 1-token probe. It is the compute core of time-to-first-token; TTFT additionally includes tokenize/schedule/sampling overhead and, on cold starts, model load.\n")
 	b.WriteString("- Peak Mem = max of two views polled at 200ms: (a) process-tree RSS summed across client + spawned backends, and (b) growth of system-wide anonymous + compressor-occupied + wired memory over a pre-launch baseline. Model weights land in exactly one view — file-backed resident pages (RSS) when an engine mmaps them for the CPU, wired Metal/IOKit buffers (system growth) when they live on the GPU — so the max counts them once per engine without double counting. Requires a quiet host. Per-engine breakdown below the table.\n\n")
 
 	// Table

@@ -33,6 +33,12 @@ GEMMA4_E4B_QAT_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_QAT_REPO)/$(GEMMA4_E4B_QAT_FIL
 GEMMA4_E4B_MTP_ASSISTANT     := google/gemma-4-E4B-it-assistant
 GEMMA4_E4B_MTP_ASSISTANT_DIR := $(HOME)/.antfly/inference/models/$(GEMMA4_E4B_MTP_ASSISTANT)
 
+# Server-based comparison engines
+OLLAMA_BIN         ?= ollama
+OLLAMA_QAT_MODEL   ?= gemma4-e4b-qat-q4_0
+VLLM_METAL_BIN     ?= $(CURDIR)/.tools/vllm-metal/bin/vllm-metal
+VLLM_QAT_MLX_MODEL ?= mlx-community/gemma-4-e4b-it-qat-OptiQ-4bit
+
 HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
 
 .DEFAULT_GOAL := help
@@ -56,6 +62,15 @@ download-gemma4-e4b-qat: ## Download Gemma 4 E4B QAT q4_0 GGUF (~5 GB)
 
 download-gemma4-e4b-mtp-assistant: ## Pull the Gemma 4 E4B MTP assistant drafter via antfly
 	$(ANTFLY_STABLE_BIN) inference pull $(GEMMA4_E4B_MTP_ASSISTANT)
+
+setup-ollama-gemma4-qat: ## Import the QAT q4_0 GGUF into the ollama store (ollama server must be running)
+	@mkdir -p .tools
+	printf 'FROM %s\n' "$(GEMMA4_E4B_QAT_PATH)" > .tools/Modelfile.gemma4-qat
+	$(OLLAMA_BIN) create $(OLLAMA_QAT_MODEL) -f .tools/Modelfile.gemma4-qat
+
+setup-vllm-metal: ## Install vllm-metal into .tools/vllm-metal (needs uv; arm64 python 3.12)
+	uv venv --python 3.12 .tools/vllm-metal
+	VIRTUAL_ENV=$(CURDIR)/.tools/vllm-metal uv pip install vllm-metal
 
 test: ## Run repo tests
 	go test ./cmd/...
@@ -111,8 +126,8 @@ EXTRA_BENCH_ARGS += \
 	-antfly-latest-dir "$(ANTFLY_SRC)"
 endif
 
-# QAT + MTP settings: single cooled canonical samples per engine and token count.
-BENCH_QAT_TOKEN_COUNTS       ?= 128,256
+# QAT + MTP settings: single cooled canonical samples per engine.
+BENCH_QAT_TOKEN_COUNTS       ?= 128
 BENCH_QAT_COOLDOWN_SECONDS   ?= 60
 BENCH_QAT_RUN_TIMEOUT        ?= 600
 BENCH_QAT_SPECULATIVE_K      ?= 2
@@ -120,7 +135,7 @@ BENCH_QAT_SPECULATION_POLICY ?= force
 
 # No `build` dependency: this target benchmarks pinned antfly binaries
 # (ANTFLY_STABLE_BIN / EXTRA_BENCH_ARGS) and must not trigger a zig build.
-bench-gemma4-e4b-qat-mtp: ## Cooled single-sample Gemma 4 E4B QAT + MTP bench vs llama.cpp
+bench-gemma4-e4b-qat-mtp: ## Cooled single-sample Gemma 4 E4B QAT + MTP bench vs llama.cpp/ollama/vllm
 	go run ./cmd/bench \
 		-model "$(GEMMA4_E4B_QAT_PATH)" \
 		-model-dir "$(MODELS_DIR)/$(GEMMA4_E4B_QAT_REPO)" \
@@ -128,12 +143,17 @@ bench-gemma4-e4b-qat-mtp: ## Cooled single-sample Gemma 4 E4B QAT + MTP bench vs
 		-prompt "$(BENCH_PROMPT)" \
 		-token-counts "$(BENCH_QAT_TOKEN_COUNTS)" \
 		-cooldown-seconds $(BENCH_QAT_COOLDOWN_SECONDS) \
+		-warmup-tokens 8 \
 		-run-timeout-seconds $(BENCH_QAT_RUN_TIMEOUT) \
 		-ignore-eos \
 		-backend-budget-mb $(GEMMA4_E4B_BUDGET_MB) \
 		-antfly-draft-model "$(GEMMA4_E4B_MTP_ASSISTANT_DIR)" \
 		-antfly-speculative-k $(BENCH_QAT_SPECULATIVE_K) \
 		-antfly-speculation-policy $(BENCH_QAT_SPECULATION_POLICY) \
+		-ollama-bin "$(OLLAMA_BIN)" \
+		-ollama-model "$(OLLAMA_QAT_MODEL)" \
+		-vllm-bin "$(wildcard $(VLLM_METAL_BIN))" \
+		-vllm-model "$(VLLM_QAT_MLX_MODEL)" \
 		-output results/gemma4-e4b-qat-mtp.md \
 		$(EXTRA_BENCH_ARGS)
 	@echo ""
