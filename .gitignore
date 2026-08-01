@@ -1,15 +1,8 @@
-# Go build artifacts
-/bin/
-*.exe
-
-# Benchmark results (regenerated on each run)
+# Generated benchmark campaigns and media fixtures
 /results/
 
-# Local antfly source checkout (used as the build source for the latest variant)
-/antfly/
-
-# Credentials (never commit)
-.env
-
-# Nightly build artifacts
-/.nightly/
+# Local reference-provider environment and caches
+/.venv/
+/.cache/
+/__pycache__/
+**/__pycache__/
