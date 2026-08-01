@@ -2,115 +2,131 @@
 
 # termite-circus
 
-Benchmark suite for the termite ML inference engine bundled in Antfly. Two
-variants are compared against [llama.cpp](https://github.com/ggml-org/llama.cpp):
+Manual, category-wide benchmarks for the local inference surface bundled in
+Antfly. A run measures exactly one caller-supplied Antfly binary. The harness
+does not install, update, fetch, select, or build Antfly, and it never posts a
+result anywhere.
 
-- **stable** — the `antfly` binary installed via brew (`brew install antflydb/taps/antfly`)
-- **latest** — `antfly` built from the [antfly](https://github.com/antflydb/antfly) main repo's `zig/` tree with the latest zig
+The suite covers every inference role documented as working in Antfly
+v0.2.0-rc.24: dense, sparse, and multimodal embedding; reranking; fixed and
+model-based chunking; GLiNER2 schema extraction; document reading/OCR;
+transcription; and local generation including Gemma 4 QAT/MTP cases.
 
-Both binaries expose a termite-zig-compatible `generate` subcommand (either as
-`antfly inference generate ...` on latest or `antfly termite generate ...` /
-bare `generate ...` on older builds). The bench harness probes for whichever
-shape the binary actually supports.
+`matrix.json` names `v0.2.0-rc.24` as its request/response contract. A newer or
+older supplied binary is still measurable, but `prereqs` emits a visible
+contract warning and provenance retains both versions.
 
-## Quick start
+Rewriters remain in the compatibility notes rather than the performance matrix
+because rc.24 documents the encoder/decoder path as unsafe or nonfunctional.
 
-```bash
-brew install antflydb/taps/antfly       # stable variant
-git clone https://github.com/antflydb/antfly antfly   # latest variant source
-make download-gemma4-e4b                # ~5 GB GGUF, skips if already present
-make bench                              # build + benchmark
-```
+## Interface
 
-`make bench` runs llama.cpp (GPU and CPU) and both antfly variants against
-Gemma 4 E4B, then writes results to `results/gemma4-e4b.md`.
-
-The `antfly/` directory at the repo root is the local source checkout for the
-latest variant. It's gitignored — clone `https://github.com/antflydb/antfly`
-into `./antfly` (or symlink an existing checkout). `make build-antfly-latest`
-(and therefore `make bench`) runs `git fetch && git checkout --force origin/main`
-before building, so the binary always tracks canonical `antflydb/antfly` HEAD.
-If `antfly/` isn't present, the latest variant is skipped; `make bench` will
-still run llama.cpp and the brew stable.
-
-## Overriding paths
-
-The two antfly binaries can be overridden:
+Running `make` only prints the available commands:
 
 ```bash
-ANTFLY_STABLE_BIN=/custom/antfly ANTFLY_SRC=/path/to/antfly make bench
+make
+make prereqs PROFILE=smoke ANTFLY_BIN=/absolute/path/to/antfly
+make models PROFILE=smoke ANTFLY_BIN=/absolute/path/to/antfly
+make smoke ANTFLY_BIN=/absolute/path/to/antfly
+make full ANTFLY_BIN=/absolute/path/to/antfly QUIET_HOST_ACK=1
+make category CATEGORY=extraction ANTFLY_BIN=/absolute/path/to/antfly
+make validate RESULT=results/campaigns/<id>
 ```
 
-## Agent workflow
+`models` is deliberately separate because it downloads artifacts. Likewise,
+`setup-tools` explicitly creates the Python 3.12 reference-provider environment;
+benchmark commands never install dependencies.
 
-The intended use is to have an agent run the benchmark and post results to Zulip:
+For a full run, populate reference-provider caches explicitly too:
 
-```
-Run `make bench` and post results/gemma4-e4b.md to #eval-runs > termite-gemma-4
-```
-
-## Nightly automated benchmark
-
-A system LaunchDaemon runs `scripts/nightly-bench.sh` at 2:05 AM Pacific
-several nights a week. It builds the latest `antfly` from the antfly main
-repo's `zig/` tree (cloned into `.nightly/antfly-src`, or reusing
-`./antfly` if present) and benchmarks it alongside the brew-installed
-stable `antfly` and llama.cpp.
-
-The nightly runner:
-- verifies the configured GGUF model is present and downloads it if needed
-- builds the latest variant with `-Doptimize=ReleaseSafe -Dskip-openapi=true`,
-  adding `-Dmlx=true` if `libmlxc.dylib` is present and falling back without
-  MLX on build failure
-- posts the report to `#eval-runs > termite-circus-nightly` on Zulip
-
-The brew stable variant currently lacks the termite-zig `generate` subcommand,
-so it's listed in the table with its version string but its perf cells stay
-empty until a future release exposes `generate`.
-
-The tracked plist template lives at:
 ```bash
-launchd/com.termite-circus.nightly-bench.plist
+make setup-tools
+make models PROFILE=full ANTFLY_BIN=/absolute/path/to/antfly
+make reference-models PROFILE=full
 ```
 
-Install or refresh it with:
+Reference subprocesses run with `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1`. Ollama, vLLM-Metal, and whisper.cpp models must be
+installed separately and named through the environment variables below. The
+prerequisite check fails before measurement when any of these inputs is absent.
+
+The default model root is `~/.antfly/inference/models`. Override it with
+`MODELS_DIR=/path`. `ANTFLY_SUBJECT_ID` is an optional display label; the
+executable's version, architecture, and SHA-256 are always derived from the
+binary itself.
+
+## Profiles
+
+`smoke` runs only the supplied Antfly binary, one lifecycle and one measured
+request, against one certified model per working role. It is a compatibility
+and correctness check, not publication evidence.
+
+`full` adds local reference runtimes and uses three fresh lifecycles per cell:
+
+- llama.cpp, Ollama, and vLLM-Metal for generators
+- ONNX Runtime and Sentence Transformers for embedding and reranking
+- the GLiNER2 local runtime for schema extraction
+- Transformers for Florence-2 OCR
+- faster-whisper and whisper.cpp for transcription
+
+Provider-native formats are allowed when a runtime cannot consume the same
+artifact. Every row therefore names the logical model, artifact, variant, and
+provider; such rows must not be described as byte-identical comparisons.
+
+Full memory results use the inference max-of-two-views method: peak rooted
+process-tree RSS versus peak growth in anonymous, compressed, and wired system
+memory. Set `QUIET_HOST_ACK=1` only when the host is quiet and the system delta
+can reasonably be attributed to the benchmark. Otherwise memory is retained as
+diagnostic data and marked with a dagger in the report.
+
+## Campaign artifacts
+
+Every attempted run writes `results/campaigns/<run-id>/`:
+
+```text
+report.md          compact category tables
+result.json        canonical normalized rows
+provenance.json    binary, model, provider, host, and input fingerprints
+receipt.json       completeness and quality-gate status
+raw/               provider logs and 200 ms memory timelines
+```
+
+A provider crash, timeout, missing quality result, or partial run remains a
+visible failed row. Raw logs do not get pasted into Markdown or sent to Zulip.
+
+## Quality before speed
+
+Each performance cell has a small deterministic gate appropriate to its role:
+semantic ordering for embeddings, relevant-document ordering for rerankers,
+expected schema values for GLiNER2, valid chunk coverage, OCR/transcription word
+recovery, and a nonempty constrained completion for generators. These fixtures
+guard against timing a broken response; they are not broad model-quality claims.
+
+The tracked matrix is [`matrix.json`](matrix.json), and deterministic text
+fixtures are in [`fixtures/cases.json`](fixtures/cases.json). Media fixtures are
+generated under the gitignored `results/fixtures/` directory with
+`make fixtures`.
+
+## Reference-provider configuration
+
+The full profile recognizes these overrides:
+
 ```bash
-sudo ./scripts/install-launchdaemon.sh
+LLAMA_CLI=/path/to/llama-cli
+OLLAMA_BIN=/path/to/ollama
+VLLM_METAL_BIN=/path/to/vllm-metal
+WHISPER_CLI=/path/to/whisper-cli
+WHISPER_CPP_MODEL=/path/to/ggml-tiny.bin
+REFERENCE_PYTHON=/path/to/python3.12
 ```
 
-Manage it with:
-```bash
-# Check status
-sudo launchctl print system/com.termite-circus.nightly-bench
+Ollama and vLLM model names may be supplied globally with `OLLAMA_MODEL` and
+`VLLM_MODEL`, or per benchmark with an uppercased benchmark identifier, for
+example `OLLAMA_MODEL_GENERATION_GEMMA4_E4B`.
 
-# Stop
-sudo launchctl bootout system /Library/LaunchDaemons/com.termite-circus.nightly-bench.plist
+No scheduler or notification service is bundled. A caller such as
+antfly-circus may archive, render, or publish a completed campaign after it has
+validated the receipt.
 
-# Start
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.termite-circus.nightly-bench.plist
-
-# Trigger immediately for a smoke test
-sudo launchctl kickstart -k system/com.termite-circus.nightly-bench
-
-# View logs
-tail -f ~/.termite-circus-nightly.log
-
-# Manual run (without Zulip post)
-./scripts/nightly-bench.sh
-
-# One-off run at a specific local time
-sudo ./scripts/schedule-launchdaemon-once.sh YYYY-MM-DD HH:MM
-```
-
-Notes:
-- `LaunchDaemon` is the right choice when you want to install and manage the
-  job entirely from a background shell with `sudo`.
-- If the machine is asleep at 2:05 AM, the run is still missed. Add a
-  scheduled wake with `pmset repeat` if that matters.
-- Override `ANTFLY_SRC_DIR` in `.env` to point at a different antfly checkout
-  (defaults to `./antfly` if present, otherwise `.nightly/antfly-src`).
-- Override `ANTFLY_STABLE_BIN` in `.env` to point at a non-brew `antfly`.
-- Override `MODEL_REPO` or `MODEL_FILE` in `.env` to use a different GGUF
-  benchmark model.
-- Override `MLX_ROOT` in `.env` if `libmlxc.dylib` is not under
-  `$HOMEBREW_PREFIX` or `~/.homebrew`.
+The disposition of the two pre-existing generator PRs and the safe parent
+repin order are recorded in [`PR_ASSESSMENT.md`](PR_ASSESSMENT.md).

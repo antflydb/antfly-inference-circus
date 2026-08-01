@@ -1,113 +1,73 @@
-# ─── Config ──────────────────────────────────────────────────────
-MODELS_DIR  := $(HOME)/.termite/models/generators
-LLAMA_CLI   ?= llama-cli
+PYTHON           ?= python3
+REFERENCE_PYTHON ?= $(CURDIR)/.venv/bin/python
+ANTFLY_BIN       ?=
+ANTFLY_SUBJECT_ID ?=
+MODELS_DIR       ?= $(HOME)/.antfly/inference/models
+PROFILE          ?= smoke
+CATEGORY         ?=
+RUN_ID           ?=
+OUTPUT           ?=
+RESULT           ?=
 
-# Antfly variants
-ANTFLY_SRC          ?= $(CURDIR)/antfly
-ANTFLY_ZIG_DIR      := $(ANTFLY_SRC)/zig
-ANTFLY_LATEST_BIN   := $(ANTFLY_ZIG_DIR)/zig-out/bin/antfly
-ANTFLY_STABLE_BIN   ?= $(shell command -v antfly 2>/dev/null)
-ANTFLY_BREW_FORMULA ?= antflydb/taps/antfly
-ZIG_BUILD_FLAGS     := -Doptimize=ReleaseFast -Dedition=full
-
-# Benchmark settings
-BENCH_PROMPT  ?= Explain what a compiler does in two sentences.
-BENCH_TOKENS  ?= 32
-
-# Gemma 4 E4B (small dense, ~5 GB)
-GEMMA4_E4B_REPO := ggml-org/gemma-4-E4B-it-GGUF
-GEMMA4_E4B_FILE := gemma-4-E4B-it-Q4_K_M.gguf
-GEMMA4_E4B_PATH  = $(MODELS_DIR)/$(GEMMA4_E4B_REPO)/$(GEMMA4_E4B_FILE)
-
-# Qwen 3.6 35B-A3B (MoE, 3B active, ~21 GB)
-QWEN36_A3B_REPO := unsloth/Qwen3.6-35B-A3B-GGUF
-QWEN36_A3B_FILE := Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-QWEN36_A3B_PATH  = $(MODELS_DIR)/$(QWEN36_A3B_REPO)/$(QWEN36_A3B_FILE)
-
-HAS_ANTFLY_SRC := $(wildcard $(ANTFLY_ZIG_DIR)/build.zig)
+CIRCUS := $(PYTHON) scripts/circus.py
+COMMON_ARGS := --profile $(PROFILE) --models-dir "$(MODELS_DIR)" --python "$(REFERENCE_PYTHON)"
+ifneq ($(strip $(ANTFLY_BIN)),)
+COMMON_ARGS += --antfly "$(ANTFLY_BIN)"
+endif
+ifneq ($(strip $(CATEGORY)),)
+COMMON_ARGS += --category "$(CATEGORY)"
+endif
 
 .DEFAULT_GOAL := help
 
-help: ## Show this help
-	@echo "termite-circus — Termite Benchmark Suite"
-	@echo ""
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
+.PHONY: help fixtures prereqs models reference-models setup-tools smoke full category validate test
 
-# ─── Models ──────────────────────────────────────────────────────
+help: ## Show commands without running a benchmark
+	@echo "termite-circus — supplied-binary Antfly inference benchmarks"
+	@echo
+	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@echo
+	@echo 'Examples:'
+	@echo '  make prereqs PROFILE=smoke ANTFLY_BIN=/absolute/path/to/antfly'
+	@echo '  make smoke ANTFLY_BIN=/absolute/path/to/antfly'
+	@echo '  make full ANTFLY_BIN=/absolute/path/to/antfly QUIET_HOST_ACK=1'
+	@echo '  make category CATEGORY=extraction ANTFLY_BIN=/absolute/path/to/antfly'
 
-download-gemma4-e4b: ## Download Gemma 4 E4B Q4_K_M GGUF (~5 GB)
-	go run ./cmd/model-dl -repo $(GEMMA4_E4B_REPO) -file $(GEMMA4_E4B_FILE)
+fixtures: ## Generate deterministic OCR, multimodal, and speech fixtures under results/
+	$(PYTHON) scripts/make_fixtures.py
 
-download-qwen3.6-a3b: ## Download Qwen 3.6 35B-A3B UD-Q4_K_M GGUF (~21 GB)
-	go run ./cmd/model-dl -repo $(QWEN36_A3B_REPO) -file $(QWEN36_A3B_FILE)
+prereqs: ## Report missing binary, model, fixture, and provider prerequisites
+	$(CIRCUS) prereqs $(COMMON_ARGS)
 
-test: ## Run repo tests
-	go test ./cmd/...
-	./scripts/nightly-bench-test.sh
+models: ## Explicitly pull the selected profile's Antfly models (networked)
+	$(CIRCUS) models $(COMMON_ARGS)
 
-# ─── Builds ──────────────────────────────────────────────────────
+reference-models: ## Explicitly cache selected Hugging Face reference models (networked)
+	$(REFERENCE_PYTHON) scripts/cache_reference_models.py --profile "$(PROFILE)" $(if $(CATEGORY),--category "$(CATEGORY)",)
 
-update-stable: ## brew upgrade the stable antfly so it tracks the latest published release
-	@brew update --quiet >/dev/null 2>&1 || true
-	@brew upgrade $(ANTFLY_BREW_FORMULA) 2>&1 | grep -v "already installed" || true
-	@echo "stable antfly: $$($(ANTFLY_STABLE_BIN) --version 2>/dev/null | head -1)"
+setup-tools: ## Explicitly create the pinned local reference-provider environment
+	uv sync --project "$(CURDIR)" --python 3.12
 
-update-antfly: ## Fetch antfly main and fast-forward $(ANTFLY_SRC)
-ifneq ($(HAS_ANTFLY_SRC),)
-	@git -C $(ANTFLY_SRC) fetch --quiet --tags --prune origin
-	@git -C $(ANTFLY_SRC) checkout --quiet --force origin/main
-	@echo "antfly @ $$(git -C $(ANTFLY_SRC) log -1 --format='%h %ci %s')"
-else
-	@echo "antfly source not found at $(ANTFLY_SRC); clone https://github.com/antflydb/antfly into $(ANTFLY_SRC) or set ANTFLY_SRC=/path/to/antfly"
-	@exit 1
-endif
+smoke: PROFILE=smoke
+smoke: fixtures ## Run one supplied Antfly binary across every working inference role
+	$(CIRCUS) prereqs $(COMMON_ARGS)
+	$(CIRCUS) run $(COMMON_ARGS) $(if $(RUN_ID),--run-id "$(RUN_ID)",) $(if $(OUTPUT),--output "$(OUTPUT)",) $(if $(ANTFLY_SUBJECT_ID),--subject-id "$(ANTFLY_SUBJECT_ID)",)
 
-build-antfly-latest: update-antfly ## Build antfly from antfly/zig with the latest zig
-	cd $(ANTFLY_ZIG_DIR) && zig build $(ZIG_BUILD_FLAGS) \
-		-Dantfly-version="$$(git -C $(ANTFLY_SRC) rev-parse --short HEAD)"
+full: PROFILE=full
+full: fixtures ## Run the full local-provider matrix with three fresh lifecycles
+	$(CIRCUS) prereqs $(COMMON_ARGS)
+	$(CIRCUS) run $(COMMON_ARGS) $(if $(RUN_ID),--run-id "$(RUN_ID)",) $(if $(OUTPUT),--output "$(OUTPUT)",) $(if $(ANTFLY_SUBJECT_ID),--subject-id "$(ANTFLY_SUBJECT_ID)",)
 
-build: update-stable build-antfly-latest ## Refresh stable + build latest antfly
+category: fixtures ## Run one category; set CATEGORY and optionally PROFILE=full
+	@test -n "$(CATEGORY)" || { echo 'CATEGORY is required' >&2; exit 2; }
+	$(CIRCUS) prereqs $(COMMON_ARGS)
+	$(CIRCUS) run $(COMMON_ARGS) $(if $(RUN_ID),--run-id "$(RUN_ID)",) $(if $(OUTPUT),--output "$(OUTPUT)",) $(if $(ANTFLY_SUBJECT_ID),--subject-id "$(ANTFLY_SUBJECT_ID)",)
 
-# ─── Benchmarks ──────────────────────────────────────────────────
+validate: ## Validate a campaign bundle; set RESULT=results/campaigns/<id>
+	@test -n "$(RESULT)" || { echo 'RESULT is required' >&2; exit 2; }
+	$(CIRCUS) validate "$(RESULT)"
 
-# $(call bench_args,<model-path>,<model-dir>,<output-md>,<backend-budget-mb>)
-define bench_args
-	-model "$(1)" \
-	-model-dir "$(2)" \
-	-llama-cli "$(LLAMA_CLI)" \
-	-prompt "$(BENCH_PROMPT)" \
-	-n $(BENCH_TOKENS) \
-	-backend-budget-mb $(4) \
-	-output $(3)
-endef
-
-# 36 GB unified memory leaves ~28 GB for the inference backend after OS + Go bench harness.
-GEMMA4_E4B_BUDGET_MB := 20480
-QWEN36_A3B_BUDGET_MB := 28672
-
-EXTRA_BENCH_ARGS :=
-ifneq ($(ANTFLY_STABLE_BIN),)
-EXTRA_BENCH_ARGS += -antfly-stable "$(ANTFLY_STABLE_BIN)"
-endif
-ifneq ($(HAS_ANTFLY_SRC),)
-EXTRA_BENCH_ARGS += \
-	-antfly-latest "$(ANTFLY_LATEST_BIN)" \
-	-antfly-latest-dir "$(ANTFLY_SRC)"
-endif
-
-bench-gemma4-e4b: build ## Bench llama.cpp + antfly variants on Gemma 4 E4B
-	go run ./cmd/bench \
-		$(call bench_args,$(GEMMA4_E4B_PATH),$(MODELS_DIR)/$(GEMMA4_E4B_REPO),results/gemma4-e4b.md,$(GEMMA4_E4B_BUDGET_MB)) \
-		$(EXTRA_BENCH_ARGS)
-	@echo ""
-	@cat results/gemma4-e4b.md
-
-bench-qwen3.6-a3b: build ## Bench llama.cpp + antfly variants on Qwen 3.6 35B-A3B
-	go run ./cmd/bench \
-		$(call bench_args,$(QWEN36_A3B_PATH),$(MODELS_DIR)/$(QWEN36_A3B_REPO),results/qwen3.6-a3b.md,$(QWEN36_A3B_BUDGET_MB)) \
-		$(EXTRA_BENCH_ARGS)
-	@echo ""
-	@cat results/qwen3.6-a3b.md
-
-bench: bench-gemma4-e4b bench-qwen3.6-a3b ## Run all benchmarks
+test: ## Run deterministic harness tests without models or an Antfly binary
+	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+	$(PYTHON) -m py_compile scripts/circus.py scripts/make_fixtures.py scripts/cache_reference_models.py providers/reference.py
