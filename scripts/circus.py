@@ -884,10 +884,10 @@ def run_campaign(args: argparse.Namespace, matrix: dict[str, Any], fixtures: dic
             for provider in order:
                 fixture = fixtures[bench["fixture"]]
                 if provider == "antfly":
-                    result = run_antfly_trial(antfly, models_dir, bench, fixture, iterations, raw_dir, trial)
+                    trial_result = run_antfly_trial(antfly, models_dir, bench, fixture, iterations, raw_dir, trial)
                 else:
-                    result = run_reference_trial(python, provider, models_dir, bench, fixture, iterations, raw_dir, trial)
-                trial_results[provider].append(result)
+                    trial_result = run_reference_trial(python, provider, models_dir, bench, fixture, iterations, raw_dir, trial)
+                trial_results[provider].append(trial_result)
         for provider in provider_ids:
             if provider in {"antfly", "llama.cpp"}:
                 artifact_label = str(artifact_path(models_dir, bench))
