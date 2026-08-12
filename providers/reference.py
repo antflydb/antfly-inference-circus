@@ -62,6 +62,36 @@ def result(latencies: list[float], quality_gate: str, quality_value: float, qual
         "quality_unit": quality_unit,
         "response": response,
     }
+def quality_failure(
+    latencies: list[float],
+    quality_gate: str,
+    reason: str,
+    quality_value: float | None,
+    quality_unit: str | None,
+    response: Any,
+) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "error": f"quality gate failed: {reason}",
+        "latencies_ms": latencies,
+        "throughput_per_second": 1000 * len(latencies) / sum(latencies) if sum(latencies) else None,
+        "quality_gate": quality_gate,
+        "quality_value": quality_value,
+        "quality_unit": quality_unit,
+        "response": response,
+        "terminal_negative": {
+            "kind": "quality-gate",
+            "stage": "quality-gate",
+            "reason": reason,
+            "observed": {
+                "quality_value": quality_value,
+                "quality_unit": quality_unit,
+                "passed": False,
+            },
+        },
+    }
+
+
 
 
 def sentence_transformers(request: dict[str, Any], onnx: bool) -> dict[str, Any]:
@@ -78,7 +108,10 @@ def sentence_transformers(request: dict[str, Any], onnx: bool) -> dict[str, Any]
         vectors = normalized_vectors(embeddings)
         margin = cosine(vectors[0], vectors[1]) - cosine(vectors[0], vectors[2])
         if margin <= 0:
-            fail(f"quality gate failed: relevant cosine margin {margin}")
+            return quality_failure(
+                latencies, "relevant cosine margin", "relevant cosine margin",
+                margin, "cosine", {"dimensions": len(vectors[0])},
+            )
         return result(latencies, "relevant cosine margin", margin, "cosine", {"dimensions": len(vectors[0])})
     if category == "sparse embedding":
         from sentence_transformers import SparseEncoder
@@ -90,7 +123,10 @@ def sentence_transformers(request: dict[str, Any], onnx: bool) -> dict[str, Any]
         vectors = normalized_vectors(embeddings)
         nonzero = sum(sum(value != 0 for value in vector) for vector in vectors)
         if nonzero < fixture["minimum_nonzero"]:
-            fail("quality gate failed: no sparse entries")
+            return quality_failure(
+                latencies, "nonzero sparse entries", "no sparse entries",
+                float(nonzero), "entries", {"vectors": len(vectors)},
+            )
         return result(latencies, "nonzero sparse entries", float(nonzero), "entries", {"vectors": len(vectors)})
     if category == "reranking":
         from sentence_transformers import CrossEncoder
@@ -101,7 +137,10 @@ def sentence_transformers(request: dict[str, Any], onnx: bool) -> dict[str, Any]
         values = [float(value) for value in scores]
         top = max(range(len(values)), key=values.__getitem__)
         if top != fixture["expected_top_index"]:
-            fail(f"quality gate failed: document {top} ranked first")
+            return quality_failure(
+                latencies, "expected document ranked first", f"document {top} ranked first",
+                0.0, "pass", {"scores": values},
+            )
         return result(latencies, "expected document ranked first", 1.0, "pass", {"scores": values})
     if category == "multimodal embedding" and onnx:
         fail("the ClipClap exact-artifact ONNX adapter requires its model_manifest input map; no safe generic fallback exists")
@@ -120,7 +159,10 @@ def gliner2_provider(request: dict[str, Any]) -> dict[str, Any]:
     found = sum(value.lower() in raw for value in fixture["expected"])
     recall = found / len(fixture["expected"])
     if recall < 1:
-        fail(f"quality gate failed: expected extraction recall {recall}")
+        return quality_failure(
+            latencies, "expected extraction values", f"expected extraction recall {recall}",
+            recall, "recall", response,
+        )
     return result(latencies, "expected extraction values", recall, "recall", response)
 
 
@@ -146,7 +188,10 @@ def tokenizer_provider(request: dict[str, Any]) -> dict[str, Any]:
 
     latencies, chunks = timed(request["iterations"], operation)
     if not chunks:
-        fail("quality gate failed: no chunks")
+        return quality_failure(
+            latencies, "nonempty ordered chunks", "no chunks",
+            0.0, "chunks", {"chunk_lengths": []},
+        )
     return result(latencies, "nonempty ordered chunks", float(len(chunks)), "chunks", {"chunk_lengths": [len(chunk) for chunk in chunks]})
 
 
@@ -173,7 +218,10 @@ def transformers_ocr(request: dict[str, Any]) -> dict[str, Any]:
     found = sum(word in text.lower() for word in expected)
     recall = found / len(expected)
     if recall < 1:
-        fail(f"quality gate failed: OCR word recall {recall}: {text!r}")
+        return quality_failure(
+            latencies, "OCR expected words", f"OCR word recall {recall}",
+            recall, "word recall", {"text": text},
+        )
     return result(latencies, "OCR expected words", recall, "word recall", {"text": text})
 
 
@@ -193,7 +241,10 @@ def faster_whisper_provider(request: dict[str, Any]) -> dict[str, Any]:
     found = sum(word in text.lower() for word in expected)
     recall = found / len(expected)
     if recall < 0.8:
-        fail(f"quality gate failed: transcription word recall {recall}: {text!r}")
+        return quality_failure(
+            latencies, "transcription expected words", f"transcription word recall {recall}",
+            recall, "word recall", {"text": text},
+        )
     return result(latencies, "transcription expected words", recall, "word recall", {"text": text})
 
 
@@ -269,7 +320,10 @@ def generation_provider(request: dict[str, Any]) -> dict[str, Any]:
 
         latencies, output = timed(iterations, operation)
         if not output.strip():
-            fail("llama.cpp produced no output")
+            return quality_failure(
+                latencies, "nonempty completion", "llama.cpp produced no output",
+                0.0, "pass", {"output_tail": output[-1000:]},
+            )
         return result(latencies, "nonempty completion", 1.0, "pass", {"output_tail": output[-1000:]})
     if provider == "ollama":
         binary = os.environ.get("OLLAMA_BIN", "ollama")
@@ -291,7 +345,10 @@ def generation_provider(request: dict[str, Any]) -> dict[str, Any]:
         finally:
             stop_process(process)
         if not str(response.get("response", "")).strip():
-            fail("Ollama produced no completion")
+            return quality_failure(
+                latencies, "nonempty completion", "Ollama produced no completion",
+                0.0, "pass", response,
+            )
         return result(latencies, "nonempty completion", 1.0, "pass", response)
     if provider == "vllm-metal":
         binary = os.environ.get("VLLM_METAL_BIN", "vllm-metal")
@@ -311,7 +368,10 @@ def generation_provider(request: dict[str, Any]) -> dict[str, Any]:
             stop_process(process)
         choices = response.get("choices") or []
         if not choices or not str(choices[0].get("text", "")).strip():
-            fail("vLLM-Metal produced no completion")
+            return quality_failure(
+                latencies, "nonempty completion", "vLLM-Metal produced no completion",
+                0.0, "pass", response,
+            )
         return result(latencies, "nonempty completion", 1.0, "pass", response)
     fail(f"unsupported generation provider {provider}")
 
@@ -334,7 +394,10 @@ def whisper_cpp_provider(request: dict[str, Any]) -> dict[str, Any]:
     found = sum(word in text.lower() for word in expected)
     recall = found / len(expected)
     if recall < 0.8:
-        fail(f"quality gate failed: transcription word recall {recall}")
+        return quality_failure(
+            latencies, "transcription expected words", f"transcription word recall {recall}",
+            recall, "word recall", {"output_tail": text[-1000:]},
+        )
     return result(latencies, "transcription expected words", recall, "word recall", {"output_tail": text[-1000:]})
 
 
