@@ -570,6 +570,23 @@ def quality_result(category: str, response: dict[str, Any], fixture: dict[str, A
         found = sum(word in text for word in expected)
         return found >= max(1, len(expected) - 1), "transcription expected words", found / len(expected), "word recall"
     return False, "unknown gate", None, None
+def quality_terminal_negative(
+    gate_name: str,
+    quality_value: float | None,
+    quality_unit: str | None,
+) -> dict[str, Any]:
+    return {
+        "kind": "quality-gate",
+        "stage": "quality-gate",
+        "reason": gate_name,
+        "observed": {
+            "quality_value": quality_value,
+            "quality_unit": quality_unit,
+            "passed": False,
+        },
+    }
+
+
 
 
 def terminate_process(process: subprocess.Popen[str]) -> None:
@@ -640,7 +657,7 @@ def run_antfly_trial(
     if error or not responses:
         return {"status": "failed", "error": error or "no response", "latencies_ms": latencies, "memory": memory, "raw_log": str(log_path.relative_to(raw_dir.parent))}
     gate, gate_name, quality, quality_unit = quality_result(bench["category"], responses[-1], fixture)
-    return {
+    result = {
         "status": "ok" if gate else "failed",
         "error": "" if gate else f"quality gate failed: {gate_name}",
         "latencies_ms": latencies,
@@ -652,6 +669,11 @@ def run_antfly_trial(
         "raw_log": str(log_path.relative_to(raw_dir.parent)),
         "response": responses[-1],
     }
+    if not gate:
+        result["terminal_negative"] = quality_terminal_negative(
+            gate_name, quality, quality_unit
+        )
+    return result
 
 
 def run_reference_trial(
@@ -718,11 +740,25 @@ def aggregate_row(
     artifact: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     successes = [trial for trial in trials if trial.get("status") == "ok"]
-    latencies = [float(value) for trial in successes for value in trial.get("latencies_ms", [])]
-    memories = [float(trial.get("memory", {}).get("peak_memory_mb", 0)) for trial in successes]
-    throughputs = [float(trial["throughput_per_second"]) for trial in successes if trial.get("throughput_per_second") is not None]
-    quality_values = [float(trial["quality_value"]) for trial in successes if trial.get("quality_value") is not None]
     status = "ok" if len(successes) == len(trials) and trials else "failed"
+    publish_performance = status == "ok"
+    latencies = (
+        [float(value) for trial in trials for value in trial.get("latencies_ms", [])]
+        if publish_performance
+        else []
+    )
+    memories = (
+        [float(trial.get("memory", {}).get("peak_memory_mb", 0)) for trial in trials]
+        if publish_performance
+        else []
+    )
+    throughputs = (
+        [float(trial["throughput_per_second"]) for trial in trials if trial.get("throughput_per_second") is not None]
+        if publish_performance
+        else []
+    )
+    quality_values = [float(trial["quality_value"]) for trial in trials if trial.get("quality_value") is not None]
+    quality_trials = [trial for trial in trials if trial.get("quality_gate")]
     row: dict[str, Any] = {
         "benchmark_id": bench["id"],
         "category": bench["category"],
@@ -736,9 +772,9 @@ def aggregate_row(
         "latency_p50_ms": percentile(latencies, 0.50),
         "latency_p95_ms": percentile(latencies, 0.95),
         "throughput_per_second": statistics.fmean(throughputs) if throughputs else None,
-        "quality_gate": successes[0].get("quality_gate") if successes else None,
+        "quality_gate": quality_trials[0].get("quality_gate") if quality_trials else None,
         "quality_value": statistics.fmean(quality_values) if quality_values else None,
-        "quality_unit": successes[0].get("quality_unit") if successes else None,
+        "quality_unit": quality_trials[0].get("quality_unit") if quality_trials else None,
         "memory_publishable": memory_publishable and bool(memories),
         "peak_memory_mean_mb": statistics.fmean(memories) if memories else None,
         "peak_memory_range_mb": [min(memories), max(memories)] if memories else None,

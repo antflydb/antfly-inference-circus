@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -99,6 +100,184 @@ class MatrixTests(unittest.TestCase):
         row = circus.aggregate_row(bench, "antfly", [{"status": "failed", "error": "boom"}], False)
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["error"], "boom")
+    def test_quality_negative_is_structural_and_exact(self) -> None:
+        negative = circus.quality_terminal_negative(
+            "relevant cosine margin", -0.25, "cosine"
+        )
+        self.assertEqual(
+            set(negative),
+            {"kind", "stage", "reason", "observed"},
+        )
+        self.assertEqual(negative["kind"], "quality-gate")
+        self.assertEqual(negative["reason"], "relevant cosine margin")
+        self.assertEqual(negative["observed"]["quality_value"], -0.25)
+
+        provider_path = ROOT / "providers" / "reference.py"
+        provider_spec = importlib.util.spec_from_file_location(
+            "termite_reference_provider_test", provider_path
+        )
+        assert provider_spec is not None and provider_spec.loader is not None
+        provider = importlib.util.module_from_spec(provider_spec)
+        provider_spec.loader.exec_module(provider)
+        result = provider.quality_failure(
+            [1.0, 2.0],
+            "expected document ranked first",
+            "document 2 ranked first",
+            0.0,
+            "pass",
+            {"scores": [0.1, 0.2, 0.9]},
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            set(result["terminal_negative"]),
+            {"kind", "stage", "reason", "observed"},
+        )
+        self.assertEqual(result["latencies_ms"], [1.0, 2.0])
+        self.assertIn("response", result)
+
+    def test_mixed_or_failed_trials_never_publish_performance(self) -> None:
+        bench = circus.select_benchmarks(self.matrix, "smoke", "generation")[0]
+        passed = {
+            "status": "ok",
+            "latencies_ms": [1.0],
+            "throughput_per_second": 1000.0,
+            "quality_gate": "nonempty completion",
+            "quality_value": 1.0,
+            "quality_unit": "pass",
+            "memory": {"peak_memory_mb": 100.0},
+        }
+        failed = {
+            "status": "failed",
+            "error": "quality gate failed: nonempty completion",
+            "latencies_ms": [2.0],
+            "throughput_per_second": 500.0,
+            "quality_gate": "nonempty completion",
+            "quality_value": 0.0,
+            "quality_unit": "pass",
+            "memory": {"peak_memory_mb": 200.0},
+            "terminal_negative": circus.quality_terminal_negative(
+                "nonempty completion", 0.0, "pass"
+            ),
+        }
+        for trials in ([passed, failed], [failed, failed]):
+            row = circus.aggregate_row(bench, "antfly", list(trials), True)
+            self.assertEqual(row["status"], "failed")
+            for field in (
+                "latency_p50_ms",
+                "latency_p95_ms",
+                "throughput_per_second",
+                "peak_memory_mean_mb",
+                "peak_memory_range_mb",
+            ):
+                self.assertIsNone(row[field])
+            self.assertFalse(row["memory_publishable"])
+
+
+    def test_cache_adapter_promotes_only_complete_quality_negatives(self) -> None:
+        adapter_path = (
+            ROOT.parent
+            / "adapters"
+            / "inference"
+            / "termite-circus"
+            / "cached_circus.py"
+        )
+        adapter_spec = importlib.util.spec_from_file_location(
+            "termite_cached_circus_test", adapter_path
+        )
+        assert adapter_spec is not None and adapter_spec.loader is not None
+        adapter = importlib.util.module_from_spec(adapter_spec)
+        adapter_spec.loader.exec_module(adapter)
+
+        class Module:
+            @staticmethod
+            def write_json(path: Path, value: dict) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(value), encoding="utf-8")
+
+        class Cache:
+            promoted: list[tuple[Path, dict]] = []
+
+            def promote(self, source: Path, desired: dict) -> None:
+                self.promoted.append((source, desired))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ", {"QUIET_HOST_ACK": "1"}
+        ):
+            campaign = Path(tmp)
+            raw = campaign / "raw"
+            raw.mkdir()
+            (raw / "trial.log").write_text("fixture\n", encoding="utf-8")
+            (raw / "trial-memory.jsonl").write_text(
+                '{"sample":1}\n', encoding="utf-8"
+            )
+            terminal_negative = circus.quality_terminal_negative(
+                "fixture gate", 0.0, "pass"
+            )
+            result = {
+                "status": "failed",
+                "error": "quality gate failed: fixture gate",
+                "latencies_ms": [1.0, 2.0],
+                "throughput_per_second": 500.0,
+                "quality_gate": "fixture gate",
+                "quality_value": 0.0,
+                "quality_unit": "pass",
+                "response": {"value": "wrong"},
+                "terminal_negative": terminal_negative,
+                "memory": {
+                    "sample_count": 2,
+                    "timeline": "raw/trial-memory.jsonl",
+                },
+                "raw_log": "raw/trial.log",
+            }
+            cell = {
+                "desired": {
+                    "protocol_identity": {"iterations_per_trial": 2},
+                    "required_roles": [
+                        "normalized-result",
+                        "raw",
+                        "memory-timeline",
+                        "log",
+                        "quiet-host",
+                    ],
+                }
+            }
+            cache = Cache()
+            adapter.promote_trial(
+                Module,
+                cache,
+                cell,
+                raw,
+                "antfly",
+                "fixture",
+                1,
+                result,
+                "2026-08-01T00:00:00Z",
+                "2026-08-01T00:01:00Z",
+            )
+            self.assertEqual(len(cache.promoted), 1)
+            promoted = cache.promoted[0][1]
+            self.assertEqual(promoted["evidence"]["status"], "failed")
+            self.assertEqual(
+                promoted["evidence"]["terminal_negative"], terminal_negative
+            )
+
+            execution = dict(result)
+            execution.pop("terminal_negative")
+            execution["error"] = "provider timed out"
+            adapter.promote_trial(
+                Module,
+                cache,
+                cell,
+                raw,
+                "antfly",
+                "fixture",
+                2,
+                execution,
+                "2026-08-01T00:02:00Z",
+                "2026-08-01T00:03:00Z",
+            )
+            self.assertEqual(len(cache.promoted), 1)
+
 
     def test_provider_variants_do_not_claim_mtp_for_references(self) -> None:
         bench = next(item for item in self.matrix["benchmarks"] if item["id"] == "generation-gemma4-e4b-qat")
