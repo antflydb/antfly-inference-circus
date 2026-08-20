@@ -70,6 +70,7 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(body["options"], {"include_spans": True})
 
         transcription = circus.select_benchmarks(self.matrix, "smoke", "transcription")[0]
+        self.assertEqual(transcription["pull"], ["openai/whisper-tiny", "--tasks", "transcribe"])
         _, transcribe_body = circus.antfly_request(transcription, self.fixtures["transcription"])
         self.assertEqual(transcribe_body["model"], "openai/whisper-tiny")
         self.assertNotIn("url", transcribe_body)
