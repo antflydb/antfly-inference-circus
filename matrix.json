@@ -199,7 +199,7 @@
       "model": "openai/whisper-tiny",
       "role": "transcribers",
       "variant": "f32",
-      "pull": ["openai/whisper-tiny"],
+      "pull": ["openai/whisper-tiny", "--tasks", "transcribe"],
       "profiles": ["smoke", "full"],
       "providers": ["antfly", "faster-whisper", "whisper.cpp"],
       "fixture": "transcription"
