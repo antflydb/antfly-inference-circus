@@ -1,8 +1,15 @@
-# Generated benchmark campaigns and media fixtures
-/results/
-
-# Local reference-provider environment and caches
+# Local environments and credentials
 /.venv/
 /.cache/
-/__pycache__/
-**/__pycache__/
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Downloaded models, corpora, media, and generated results
+/.data/
+/results/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
