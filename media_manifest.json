@@ -1,0 +1,124 @@
+{
+ "width": 1024,
+ "librispeech": {
+  "repo": "hf-internal-testing/librispeech_asr_dummy",
+  "revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a",
+  "file": "clean/validation-00000-of-00001.parquet"
+ },
+ "images": [
+  {
+   "name": "img00.jpg",
+   "title": "File:Sturnus vulgaris (European starling) at Bodega Head-1209.jpg",
+   "bytes": 312263,
+   "sha256": "55a5afb4b849ed517a811d2331644f920f103a068e44451692ff87b3502073c6"
+  },
+  {
+   "name": "img01.jpg",
+   "title": "File:Trier, 09-12-2023 (actm.) 04.jpg",
+   "bytes": 624584,
+   "sha256": "1987c290a378c00c93e2771ecf930e38daffedd85420c0f1b44d32dea585b8bc"
+  },
+  {
+   "name": "img02.jpg",
+   "title": "File:Monasterio de El Escorial en Madrid.jpg",
+   "bytes": 569477,
+   "sha256": "9575282081600122a76a13ea9ecec892aab07008b5dce7e355782a5233da62bc"
+  },
+  {
+   "name": "img03.jpg",
+   "title": "File:Rue des Anes Brules in St-Clair (1).jpg",
+   "bytes": 817942,
+   "sha256": "dbc70c4ab72f797c13d18520fee9f6821eba6f2c1577d8f21ba334251467af47"
+  },
+  {
+   "name": "img04.jpg",
+   "title": "File:La Palma - Cuervo Canario.jpg",
+   "bytes": 233695,
+   "sha256": "5f9f4855fd24065e07c921e133795bc7b4f02f649ca5939340621d9f6987c68a"
+  },
+  {
+   "name": "img05.jpg",
+   "title": "File:Allegory Treaty of the Pyrenees - Giovanni Francesco Romanelli - Louvre, INV 20349.jpg",
+   "bytes": 1013812,
+   "sha256": "161c5068d98d90f15f6b5d6d4cdb49f491cb54729bb2d18ca06244fbcc9db2fe"
+  },
+  {
+   "name": "img06.jpg",
+   "title": "File:46-236-0032 Pisky Church RB 24.jpg",
+   "bytes": 358697,
+   "sha256": "c1dce26c5eb4b6483d66b32166d99b94c54297c3426fd822e5df6595538b3476"
+  },
+  {
+   "name": "img07.jpg",
+   "title": "File:Red Arrows Formation Duxford Flying Finale 2024 02.jpg",
+   "bytes": 90811,
+   "sha256": "033627378124d85396452e9d037c016026a871c5332d0ae438e68ea5cba783b2"
+  }
+ ],
+ "audio": [
+  {
+   "name": "aud00.wav",
+   "id": "1272-128104-0000",
+   "seconds": 5.86,
+   "text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+   "bytes": 187404,
+   "sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46"
+  },
+  {
+   "name": "aud01.wav",
+   "id": "1272-128104-0002",
+   "seconds": 12.48,
+   "text": "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND",
+   "bytes": 399564,
+   "sha256": "5f4d8f7331acffc3d2efbe0f764b9eb3447911dc17f9843e38e1083eb1685b9c"
+  },
+  {
+   "name": "aud02.wav",
+   "id": "1272-128104-0003",
+   "seconds": 9.9,
+   "text": "HE HAS GRAVE DOUBTS WHETHER SIR FREDERICK LEIGHTON'S WORK IS REALLY GREEK AFTER ALL AND CAN DISCOVER IN IT BUT LITTLE OF ROCKY ITHACA",
+   "bytes": 316844,
+   "sha256": "fc23353b884061a5c5784b0cf6b5c539680c50cfae993882822ebdd4a06ddf8c"
+  },
+  {
+   "name": "aud03.wav",
+   "id": "1272-128104-0005",
+   "seconds": 9.01,
+   "text": "IT IS OBVIOUSLY UNNECESSARY FOR US TO POINT OUT HOW LUMINOUS THESE CRITICISMS ARE HOW DELICATE IN EXPRESSION",
+   "bytes": 288364,
+   "sha256": "abd89d9a5108f87f03d03875272e1f3f18bef61ea4c271a0ec5bbc3a5bfc223a"
+  },
+  {
+   "name": "aud04.wav",
+   "id": "1272-128104-0006",
+   "seconds": 5.64,
+   "text": "ON THE GENERAL PRINCIPLES OF ART MISTER QUILTER WRITES WITH EQUAL LUCIDITY",
+   "bytes": 180524,
+   "sha256": "acbc588a1ba63290a48aeb9b37c815475627ba58a815ff095042fa61729fe3a0"
+  },
+  {
+   "name": "aud05.wav",
+   "id": "1272-128104-0007",
+   "seconds": 9.24,
+   "text": "PAINTING HE TELLS US IS OF A DIFFERENT QUALITY TO MATHEMATICS AND FINISH IN ART IS ADDING MORE FACT",
+   "bytes": 295724,
+   "sha256": "66ea55755fe31a7af9bb121ad33fd2037dbc8e2fc66d4cfb3f50cb8fa1e63561"
+  },
+  {
+   "name": "aud06.wav",
+   "id": "1272-128104-0008",
+   "seconds": 5.12,
+   "text": "AS FOR ETCHINGS THEY ARE OF TWO KINDS BRITISH AND FOREIGN",
+   "bytes": 163884,
+   "sha256": "9514dcfa2f52cd7540c686c555213ca539b7ec8913b93913d14bfed151bdb72e"
+  },
+  {
+   "name": "aud07.wav",
+   "id": "1272-128104-0010",
+   "seconds": 5.6,
+   "text": "NEAR THE FIRE AND THE ORNAMENTS FRED BROUGHT HOME FROM INDIA ON THE MANTEL BOARD",
+   "bytes": 179244,
+   "sha256": "f656fbff06c64a890bda6e03f259257ad62d37f4804d2d3b46801d8ec8a0ee8d"
+  }
+ ]
+}
