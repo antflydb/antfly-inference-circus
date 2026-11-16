@@ -45,7 +45,6 @@ WORKLOADS: dict[str, dict[str, Any]] = {
             "mixed_paragraph_x1": 32,
             "ent_paragraph_b8": 8,
             "ent_paragraph_b32": 4,
-            "long_book_w384": 15,
         },
     },
     "gliner-decide": {
@@ -79,7 +78,7 @@ WORKLOADS: dict[str, dict[str, Any]] = {
         "script": "whisper_bench.py",
         "script_args": [],
         "arms": {"antfly": "antfly", "transformers": "transformers", "whisper.cpp": "whisper.cpp"},
-        "cells": {"short": 1, "batch4": 1, "multiwindow60": 1},
+        "cells": {"short": 1},
     },
     "ocr": {
         "workload": "ocr",
@@ -234,8 +233,7 @@ def speed_summary(root: Path, key: str, spec: dict, cells: dict[str, int], lifec
                     "directly_comparable": False,
                     "reason": (
                         "whisper.cpp measures fresh-process first-inference compute with model load excluded, "
-                        "while Antfly is server-resident and warmed; batch4 is sequential files in whisper.cpp "
-                        "but concurrent requests in Antfly"
+                        "while Antfly is server-resident and warmed"
                     ),
                 }
             if agreement is not None:

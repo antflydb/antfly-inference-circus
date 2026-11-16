@@ -27,6 +27,17 @@ latency, throughput, quality/agreement, memory, errors, and artifact
 provenance. A provider error remains a failed result; it is not replaced with a
 successful fallback.
 
+A measured sample is one inference API operation, including a batch submitted
+in one operation. The suite excludes document-window scans with merged results,
+multi-window audio, and workloads assembled from concurrent independent
+requests. Warmups and independent measured repetitions remain separate samples,
+not a composite workload.
+
+Batch workloads remain batch-API comparisons: native runtimes may microbatch
+internally, so one API operation does not establish equal physical-forward
+counts. Autoregressive decoding and image patch processing are intrinsic parts
+of one inference operation, not harness request fan-out.
+
 Gemma 4 uses the same QAT Q4_0 GGUF and multimodal projector bytes for Antfly
 and llama.cpp, and setup verifies those files. Whisper is different by design:
 Transformers reads the pinned Hugging Face safetensors while whisper.cpp reads
@@ -37,10 +48,9 @@ Speed uses three fresh paired lifecycles by default; memory runs each cell
 alone in a separate fresh lifecycle. Antfly and Python references are warmed.
 whisper.cpp uses a fresh CLI process and reports its native total time minus
 model-load time: that remains cold first-inference compute, not warmed serving
-latency. Its four-file cell is sequential, while Antfly submits four concurrent
-requests and Transformers uses a four-item batch. The results retain these
-differences and do not present whisper.cpp as an unqualified warm speedup.
-The speech server admits four requests with a bounded 1,024-unit work budget.
+latency. Results retain that timing difference and do not present whisper.cpp
+as an unqualified warm speedup. Speech measures one short recording per
+operation; reference and server warmups remain outside the measured call.
 
 Memory is sampled across the rooted process tree every 200 ms. Metal uses
 macOS `phys_footprint`; CUDA uses Linux `Pss_Anon + Pss_Shmem + Pss_File` plus

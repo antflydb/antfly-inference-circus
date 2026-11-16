@@ -80,6 +80,40 @@ class CompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown cell"):
             summarize.selected_cells(summarize.WORKLOADS["embed"], "not-a-cell")
 
+    def test_removed_composite_selectors_are_rejected_before_inference(self) -> None:
+        removed = (
+            ("gliner-base", "long_book_w384", "gliner_bench.py", ["--model", "base"]),
+            ("whisper", "batch4", "whisper_bench.py", []),
+            ("whisper", "multiwindow60", "whisper_bench.py", []),
+        )
+        for model, cell, script, model_args in removed:
+            with self.subTest(model=model, cell=cell), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "run"
+                process = subprocess.run(
+                    [
+                        sys.executable, str(ROOT / "scripts/run_bench.py"),
+                        "--model", model, "--only-cell", cell, "--output", str(output),
+                    ],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(process.returncode, 0)
+                result = json.loads((output / "result.json").read_text())
+                self.assertIn("unknown cell", result["error"])
+                self.assertIn(cell, result["error"])
+                direct_output = Path(temporary) / "direct"
+                direct = subprocess.run(
+                    [
+                        sys.executable, str(ROOT / "scripts" / script), "run",
+                        *model_args, "--antfly", str(Path(temporary) / "missing-antfly"),
+                        "--only-cell", cell, "--out", str(direct_output),
+                    ],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(direct.returncode, 2)
+                self.assertIn("--only-cell", direct.stderr)
+                self.assertIn(cell, direct.stderr)
+                self.assertFalse(direct_output.exists())
+
     def test_short_corpus_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             corpus_path = Path(temporary) / "corpus.json"

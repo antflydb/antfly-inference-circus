@@ -2,14 +2,12 @@
 """Paired Whisper-small benchmark: Antfly, Transformers, and whisper.cpp.
 
 All arms use openai/whisper-small, forced English transcription, greedy decoding,
-and text-only output.  The cells cover one short LibriSpeech clip, a cohort of
-four clips, and one deterministic recording longer than two 30-second windows.
+and text-only output. The workload is one short LibriSpeech clip per invocation.
 """
 from __future__ import annotations
 
 import argparse
 import base64
-import concurrent.futures
 import http.client
 import importlib.metadata
 import json
@@ -18,7 +16,6 @@ import os
 import re
 import subprocess
 import sys
-import threading
 import time
 import unicodedata
 import wave
@@ -32,7 +29,7 @@ MODEL = "openai/whisper-small"
 MODELS = [MODEL]
 WORKLOAD = "whisper"
 PROVIDERS = ["antfly", "transformers", "whisper.cpp"]
-CELLS = ["short", "batch4", "multiwindow60"]
+CELLS = ["short"]
 REVISION = "973afd24965f72e36ca33b3055d56a652f456b4d"
 SOURCE_WEIGHT_SHA256 = "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b"
 MEDIA_MANIFEST = C.ROOT / "media_manifest.json"
@@ -95,63 +92,29 @@ def _verified_manifest() -> dict[str, Any]:
     manifest = json.loads(MEDIA_MANIFEST.read_text(encoding="utf-8"))
     audio = manifest.get("audio")
     source = manifest.get("librispeech") or {}
-    if not isinstance(audio, list) or len(audio) < 8:
-        raise ValueError("media_manifest.json must contain at least eight audio fixtures")
+    if not isinstance(audio, list) or not audio:
+        raise ValueError("media_manifest.json must contain an audio fixture")
     if source.get("revision") != "5be91486e11a2d616f4ec5db8d3fd248585ac07a":
         raise ValueError("unexpected LibriSpeech fixture revision")
-    for entry in audio[:8]:
-        path = C.MEDIA / entry["name"]
-        if C.sha256_file(path) != entry["sha256"]:
-            raise ValueError(f"audio fixture checksum differs: {entry['name']}")
+    entry = audio[0]
+    path = C.MEDIA / entry["name"]
+    if C.sha256_file(path) != entry["sha256"]:
+        raise ValueError(f"audio fixture checksum differs: {entry['name']}")
+    with wave.open(str(path), "rb") as source:
+        if (source.getnchannels(), source.getsampwidth(), source.getframerate(),
+                source.getcomptype()) != (1, 2, 16000, "NONE"):
+            raise ValueError(f"unexpected WAV format: {entry['name']}")
     return manifest
 
 
-def concatenate_wav(entries: list[dict[str, Any]], destination: Path) -> float:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    frames: list[bytes] = []
-    params = None
-    total_frames = 0
-    for entry in entries:
-        with wave.open(str(C.MEDIA / entry["name"]), "rb") as source:
-            current = (source.getnchannels(), source.getsampwidth(), source.getframerate(), source.getcomptype())
-            if current != (1, 2, 16000, "NONE"):
-                raise ValueError(f"unexpected WAV format: {entry['name']} {current}")
-            if params is None:
-                params = current
-            data = source.readframes(source.getnframes())
-            frames.append(data)
-            total_frames += len(data) // 2
-    with wave.open(str(destination), "wb") as target:
-        target.setnchannels(1)
-        target.setsampwidth(2)
-        target.setframerate(16000)
-        target.writeframes(b"".join(frames))
-    return total_frames / 16000
-
-
-def make_cells(only: str | None, out: Path) -> list[dict[str, Any]]:
-    audio = _verified_manifest()["audio"][:8]
-    long_path = out / "inputs" / "libri-multiwindow60.wav"
-    long_seconds = concatenate_wav(audio, long_path)
-    if long_seconds < 60:
-        raise ValueError(f"multiwindow fixture is only {long_seconds:.2f}s")
-
-    def call(entry: dict[str, Any]) -> dict[str, Any]:
-        return {"id": entry["id"], "path": C.MEDIA / entry["name"],
-                "ref": entry["text"], "seconds": float(entry["seconds"]),
-                "sha256": entry["sha256"]}
-
-    cells = [
-        {"id": "short", "calls": [call(audio[0])]},
-        {"id": "batch4", "calls": [call(entry) for entry in audio[:4]]},
-        {"id": "multiwindow60", "calls": [{"id": "multiwindow60", "path": long_path,
-             "ref": " ".join(entry["text"] for entry in audio), "seconds": long_seconds,
-             "sha256": C.sha256_file(long_path)}]},
-    ]
-    selected = [cell for cell in cells if only in (None, cell["id"])]
-    if not selected:
+def make_cells(only: str | None) -> list[dict[str, Any]]:
+    if only not in (None, "short"):
         raise ValueError(f"unknown cell: {only}")
-    return selected
+    entry = _verified_manifest()["audio"][0]
+    return [{"id": "short", "calls": [
+        {"id": entry["id"], "path": C.MEDIA / entry["name"],
+         "ref": entry["text"], "seconds": float(entry["seconds"]),
+         "sha256": entry["sha256"]}]}]
 
 
 def _antfly_request(call: dict[str, Any]) -> bytes:
@@ -177,14 +140,6 @@ def _antfly_one(port: int, data: bytes) -> tuple[str, float]:
     return payload["text"], elapsed_ms
 
 
-def _start_workers(pool: concurrent.futures.ThreadPoolExecutor, count: int) -> None:
-    gate = threading.Barrier(count + 1)
-    workers = [pool.submit(gate.wait, 30) for _ in range(count)]
-    gate.wait(timeout=30)
-    for worker in workers:
-        worker.result()
-
-
 def _cell_row(arm: str, cell: dict[str, Any], texts: list[str], elapsed_ms: float,
               lc: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     references = [call["ref"] for call in cell["calls"]]
@@ -202,48 +157,29 @@ def _cell_row(arm: str, cell: dict[str, Any], texts: list[str], elapsed_ms: floa
 
 def run_antfly(args: argparse.Namespace, cells: list[dict[str, Any]], out: Path, lc: int) -> dict[str, Any]:
     tag = f"lc{lc}-antfly"
-    requests = {cell["id"]: [_antfly_request(call) for call in cell["calls"]] for cell in cells}
-    server = C.AntflyServer(args.antfly, out, tag, models_dir=C.MODELS_DIR,
-                           extra_args=["--max-concurrent-requests", "4", "--max-work-units", "1024"])
+    requests = {cell["id"]: _antfly_request(cell["calls"][0]) for cell in cells}
+    server = C.AntflyServer(args.antfly, out, tag, models_dir=C.MODELS_DIR)
     info: dict[str, Any] = {"provider": "antfly", "arm": "antfly", "model": MODEL,
                             "binary": C.file_identity(args.antfly), "host_before": C.host_snapshot(),
                             "decoding": {"language": "en", "strategy": "greedy",
                                          "timestamps": False, "audio_context": "full"}}
     info.update(server.start())
-    pool: concurrent.futures.ThreadPoolExecutor | None = None
     try:
-        if any(cell["id"] == "batch4" for cell in cells):
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-            _start_workers(pool, 4)
-        warm_text, warm_ms = _antfly_one(server.port, requests[cells[0]["id"]][0])
+        warm_text, warm_ms = _antfly_one(server.port, requests[cells[0]["id"]])
         info["warmup"] = {"performed": True, "ms": round(warm_ms, 3),
                           "nonempty": bool(normalize_text(warm_text))}
         rows = []
         for cell in cells:
-            if cell["id"] == "batch4":
-                if pool is None:
-                    raise RuntimeError("Antfly batch worker pool was not initialized")
-                started = time.perf_counter()
-                values = list(pool.map(lambda data: _antfly_one(server.port, data), requests[cell["id"]]))
-                wall_ms = (time.perf_counter() - started) * 1000
-                texts = [value[0] for value in values]
-                request_ms = [round(value[1], 3) for value in values]
-            else:
-                value = _antfly_one(server.port, requests[cell["id"]][0])
-                texts, request_ms = [value[0]], [round(value[1], 3)]
-                wall_ms = value[1]
-            semantics = ("four concurrent HTTP requests eligible for Antfly tensor microbatching"
-                         if cell["id"] == "batch4" else "one HTTP request")
+            text, wall_ms = _antfly_one(server.port, requests[cell["id"]])
+            texts = [text]
             rows.append({"call": _cell_row("antfly", cell, texts, wall_ms, lc,
-                         {"request_ms": request_ms, "batch_semantics": semantics,
+                         {"request_ms": [round(wall_ms, 3)],
                           "warmup_state": "same server process after one inference warmup",
-                          "timing_basis": "pre-encoded HTTP request dispatch through complete response-body read; WAV/base64/JSON preparation and worker startup excluded"}),
+                          "timing_basis": "pre-encoded HTTP request dispatch through complete response-body read; WAV/base64/JSON preparation excluded"}),
                          "texts": texts, "refs": [call["ref"] for call in cell["calls"]]})
         info["rows"] = rows
         return info
     finally:
-        if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=True)
         info["host_after"] = C.host_snapshot()
         info["footprint"] = server.stop()
         sanitize_log(out / f"{tag}.server.log")
@@ -332,12 +268,11 @@ def run_cpp_arm(cells: list[dict[str, Any]], out: Path, lc: int) -> dict[str, An
     for cell in cells:
         work = out / "cpp" / f"lc{lc}-{cell['id']}"
         work.mkdir(parents=True, exist_ok=True)
-        output_bases = [work / f"result-{index}" for index in range(len(cell["calls"]))]
+        output_base = work / "result"
         command: list[str | Path] = [binary, "--model", model, "--language", "en",
             "--no-timestamps", "--best-of", "1", "--beam-size", "1", "--temperature", "0",
             "--temperature-inc", "0", "--no-fallback", "--output-json"]
-        for call, output_base in zip(cell["calls"], output_bases, strict=True):
-            command.extend(["--file", call["path"], "--output-file", output_base])
+        command.extend(["--file", cell["calls"][0]["path"], "--output-file", output_base])
         log_path = out / f"lc{lc}-whisper-cpp-{cell['id']}.log"
         started = time.perf_counter()
         process: subprocess.Popen | None = None
@@ -371,23 +306,18 @@ def run_cpp_arm(cells: list[dict[str, Any]], out: Path, lc: int) -> dict[str, An
         log_text = log_path.read_text(encoding="utf-8")
         if returncode != 0:
             raise RuntimeError(f"whisper.cpp exited {returncode}; see {log_path.name}")
-        texts = []
-        for output_base in output_bases:
-            output_path = output_base.with_suffix(".json")
-            payload = json.loads(output_path.read_text(encoding="utf-8"))
-            texts.append("".join(segment["text"] for segment in payload["transcription"]).strip())
-            output_path.unlink()
+        output_path = output_base.with_suffix(".json")
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        texts = ["".join(segment["text"] for segment in payload["transcription"]).strip()]
+        output_path.unlink()
         timings = _parse_cpp_timings(log_text)
         compute_ms = _cpp_compute_ms(timings)
-        semantics = ("one whisper-cli process loading the model once and processing four files sequentially; "
-                     "whisper.cpp exposes no cross-file batch API"
-                     if cell["id"] == "batch4" else "one whisper-cli process")
         rows.append({"call": _cell_row("whisper.cpp", cell, texts, compute_ms, lc,
                     {"wall_ms": round(wall_ms, 3), "model_load_ms": timings["load_time"],
                      "timing_basis": "required native total_time minus required native load_time",
                      "warmup_state": "fresh process, first inference, no inference warmup",
                      "audio_x_realtime_basis": "cold-process first-inference compute time with model load excluded",
-                     "batch_semantics": semantics, "native_timings_ms": timings}), "texts": texts,
+                     "native_timings_ms": timings}), "texts": texts,
                      "refs": [call["ref"] for call in cell["calls"]]})
         arm_footprints.append(footprint)
         commands.append(C.public_command(command))
@@ -410,11 +340,11 @@ def _read_wav(path: Path):
         return np.frombuffer(audio.readframes(audio.getnframes()), dtype="<i2").astype("float32") / 32768.0
 
 
-def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
+def transformers_arm(only: str | None, lc: int) -> dict[str, Any]:
     import torch
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-    cells = make_cells(only, out)
+    cells = make_cells(only)
     reference = Path(C.reference_paths()[MODEL])
     device = C.ACCEL
     processor = AutoProcessor.from_pretrained(reference, local_files_only=True)
@@ -425,20 +355,15 @@ def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
                           dtype=torch.float32)
     generate = {"language": "en", "task": "transcribe", "do_sample": False, "num_beams": 1}
 
-    prepared = {cell["id"]: [{"raw": _read_wav(Path(call["path"])), "sampling_rate": 16000}
-                              for call in cell["calls"]] for cell in cells}
+    prepared = {cell["id"]: {"raw": _read_wav(Path(cell["calls"][0]["path"])),
+                              "sampling_rate": 16000} for cell in cells}
 
-    def infer(inputs: list[dict[str, Any]]):
-        # The pipeline pops audio and sampling_rate from each input dictionary.
-        # Preserve the prepared arrays for both warmup and measured requests.
-        request = [dict(item) for item in inputs]
-        argument: Any = request if len(request) > 1 else request[0]
-        result = recognizer(argument, batch_size=len(inputs), chunk_length_s=30,
-                            return_timestamps=False, generate_kwargs=generate)
-        values = result if isinstance(result, list) else [result]
-        return [value["text"] for value in values]
+    def infer(inputs: dict[str, Any]) -> list[str]:
+        # The pipeline pops audio and sampling_rate; retain the prepared audio.
+        result = recognizer(dict(inputs), return_timestamps=False, generate_kwargs=generate)
+        return [result["text"]]
 
-    infer(prepared[cells[0]["id"]][:1])
+    infer(prepared[cells[0]["id"]])
     rows = []
     sync = C.torch_sync(torch)
     for cell in cells:
@@ -447,11 +372,8 @@ def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
         texts = infer(prepared[cell["id"]])
         sync()
         elapsed_ms = (time.perf_counter() - started) * 1000
-        semantics = ("one Transformers pipeline call with batch_size=4"
-                     if cell["id"] == "batch4" else "one Transformers pipeline call")
         rows.append({"call": _cell_row("transformers", cell, texts, elapsed_ms, lc,
-                    {"batch_semantics": semantics,
-                     "warmup_state": "same Python/model process after one inference warmup",
+                    {"warmup_state": "same Python/model process after one inference warmup",
                      "timing_basis": "ASR pipeline feature extraction, model inference, and decode; WAV file read excluded"}),
                     "texts": texts, "refs": [call["ref"] for call in cell["calls"]]})
     versions = {package: importlib.metadata.version(package) for package in ("torch", "transformers", "numpy")}
@@ -459,7 +381,7 @@ def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
             "versions": versions, "dtype": "float32", "device": device,
             "warmup": {"performed": True, "state": "one inference before measured cells"},
             "decoding": {"language": "en", "task": "transcribe", "do_sample": False,
-                         "num_beams": 1, "return_timestamps": False, "chunk_length_s": 30},
+                         "num_beams": 1, "return_timestamps": False},
             "device_memory": C.torch_device_bytes(torch), "rows": rows}
 
 
@@ -472,7 +394,7 @@ def pyarm_main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     C.configure_backend(args.backend)
     try:
-        result = transformers_arm(args.only_cell, args.out, args.lc)
+        result = transformers_arm(args.only_cell, args.lc)
     except Exception as exc:  # child must return a structured terminal record
         result = {"provider": "transformers", "arm": "transformers", "model": MODEL,
                   "error": public_error(exc)}
@@ -534,7 +456,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     C.exclusive_bench_lock()
     out = Path(args.out)
     C.prepare_output(out)
-    cells = make_cells(args.only_cell, out)
+    cells = make_cells(args.only_cell)
     same_weights = verify_same_weights()
     cpp_binary, cpp_model, cpp_provenance_path = _cpp_paths()
     cpp_provenance = validate_cpp_provenance(cpp_model, cpp_provenance_path)
