@@ -28,6 +28,71 @@ REFERENCES = Path(os.environ.get("TERMITE_REFERENCES", DATA / "reference_snapsho
 DARWIN = sys.platform == "darwin"
 
 
+def reference_precision(model, *, requested_dtype=None, default_policy="library_default", override_reason=None) -> dict:
+    import precision
+    return precision.reference_precision(model, requested_dtype=requested_dtype,
+                                         default_policy=default_policy, override_reason=override_reason)
+
+
+def native_precision(binary, model, models_dir=None) -> dict:
+    import precision
+    result = precision.native_precision(Path(binary), model, Path(models_dir or MODELS_DIR), ANTFLY_BACKEND)
+    result["environment_overrides"] = {key: public_path(value) if os.path.isabs(value) else value
+                                       for key, value in result["environment_overrides"].items()}
+    return result
+
+
+def api_error(body) -> dict:
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        return {key: public_error(error[key]) if key == "message" else str(error[key])[:1000]
+                for key in ("code", "message") if error.get(key) is not None}
+    return {"message": public_error(error)} if isinstance(error, str) else {}
+
+
+def call_refused(row: dict) -> bool:
+    """A structured request rejection, not a transport/server error or universal support claim."""
+    return row.get("ok") is False and row.get("status") in {400, 413, 422} and bool(row.get("response_error"))
+
+
+class HttpResponseError(RuntimeError):
+    """A received HTTP failure; status alone does not establish request refusal."""
+
+    def __init__(self, status: int, body):
+        self.status = status
+        self.response_error = api_error(body)
+        super().__init__(f"HTTP {status}: {self.response_error.get('message', 'request failed')}")
+
+    def call_fields(self) -> dict:
+        return {"ok": False, "status": self.status, "response_error": self.response_error,
+                "error": public_error(self)}
+
+
+def http_warmup(client, endpoint: str, requests, info: dict, cell: str) -> str:
+    """Record actual planned warmups; do not admit timing after a hard failure."""
+    observations, state = [], "complete"
+    for payload in requests:
+        started = time.perf_counter()
+        try:
+            status, body, _ = client.post(endpoint, payload)
+            if status != 200:
+                raise HttpResponseError(status, body)
+            expected = len(payload.get("input", payload.get("inputs", [])))
+            if not isinstance(body, dict) or not isinstance(body.get("data"), list) or len(body["data"]) != expected:
+                raise RuntimeError("warmup returned malformed successful response")
+            observation = {"ok": True, "status": status}
+        except Exception as error:
+            observation = error.call_fields() if isinstance(error, HttpResponseError) else {
+                "ok": False, "error": public_error(error)}
+            state = "refused" if call_refused(observation) else "failed"
+        observation["ms"] = (time.perf_counter() - started) * 1000
+        observations.append(observation)
+        if state == "failed":
+            info.setdefault("error", f"{cell} warmup failed: {observation['error']}")
+            break
+    info.setdefault("warmups", {})[cell] = {"state": state, "calls": observations}
+    return state
+
 def resolve_backend(value: str | None = None) -> tuple[str, str]:
     """Return the Antfly and PyTorch accelerator names for a requested backend."""
     requested = (value or os.environ.get("TERMITE_BACKEND", "auto")).lower()
@@ -231,23 +296,6 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-class _RusageV4:
-    """macOS proc_pid_rusage reader that does not suspend the target."""
-
-    def __init__(self):
-        import ctypes
-
-        self.ct = ctypes
-        self.lib = ctypes.CDLL("/usr/lib/libproc.dylib")
-        self.buf = (ctypes.c_uint64 * 64)()
-
-    def read(self, pid: int):
-        if self.lib.proc_pid_rusage(pid, 4, self.ct.byref(self.buf)) != 0:
-            return None
-        fields = list(self.buf)[2:]
-        return {"fp": fields[7], "rss": fields[6], "lifetime_max": fields[28]}
-
-
 class _SmapsNvml:
     """Linux smaps_rollup and optional per-process NVML memory reader."""
 
@@ -308,8 +356,36 @@ class _SmapsNvml:
         }
 
 
+def sampled_model_paths() -> list[Path]:
+    roots = {MODELS_DIR, DATA / "reference-verified"}
+    roots.update(Path(value) for key in ("TERMITE_GEN_MODELS_DIR", "TERMITE_WHISPER_CPP_MODEL")
+                 if (value := os.environ.get(key)))
+    if REFERENCES.is_file():
+        roots.update(Path(path) for path in reference_paths().values())
+    pending = [path.resolve() for path in roots if path.exists()]
+    observed = set()
+    def unreadable(error):
+        raise error
+    while pending:
+        root = pending.pop()
+        if root in observed:
+            continue
+        observed.add(root)
+        if root.is_dir():
+            for directory, directories, files in os.walk(root, followlinks=False, onerror=unreadable):
+                for name in (*directories, *files):
+                    path = Path(directory) / name
+                    if path.is_symlink():
+                        pending.append(path.resolve(strict=True))
+    return sorted(observed)
+
+
+def memory_sampling_enabled() -> bool:
+    return os.environ.get("TERMITE_SAMPLE_MEMORY", "0") == "1"
+
+
 class Sampler:
-    """Sample summed process-tree footprint every 0.2 seconds."""
+    """Non-suspending concurrent process-tree observations; independent peaks never sum."""
 
     def __init__(self, pid: int, out_dir: Path, tag: str, interval: float = 0.2):
         import threading
@@ -318,24 +394,36 @@ class Sampler:
         self.root, self.interval, self.psutil = pid, interval, psutil
         self.out = out_dir / f"{tag}.footprint.json"
         self.timeline = (out_dir / f"{tag}.footprint.jsonl").open("w", encoding="utf-8")
-        self.reader = _RusageV4() if DARWIN else _SmapsNvml()
-        self.peak: dict[str, Any] = {
-            "process_tree_footprint_peak_bytes": 0,
-            "peak_rss_bytes": 0,
-            "lifetime_max_footprint_bytes": 0,
-            "samples": 0,
+        if DARWIN:
+            from memory_darwin import DarwinMemoryReader
+            evidence = os.environ.get("TERMITE_METAL_MAPPING_EVIDENCE")
+            # Python's loaded runtime needs more than the native-only 150 ms
+            # allowance. This phase is isolated from latency measurements; keep
+            # the full walk bounded and reject it, never truncate, at the limit.
+            self.reader = DarwinMemoryReader(sampled_model_paths(), max_seconds=2.0,
+                mapping_scope="posix-mmap-top-level" if evidence else "all-model-mappings",
+                mapping_scope_evidence=evidence)
+        else:
+            self.reader = _SmapsNvml()
+        self.peak = {
+            "metric_version": "darwin-ledger-mapped-storage-interval-v1" if DARWIN else "linux-pss-nvml-v1",
+            "memory_peak_lower_bytes": 0, "memory_peak_upper_bytes": 0,
+            "raw_process_tree_footprint_peak_bytes": 0, "peak_rss_bytes": 0,
+            "samples": 0, "invalid_samples": 0, "observer_seconds": 0.0,
+            "max_sample_gap_seconds": 0.0, "coverage_errors": [],
         }
+        self.sample_process_count = 0
+        self.processes_seen: set[int] = set()
+        if DARWIN:
+            self.peak.update({
+                "coverage_scope": self.reader.mapping_scope,
+                "coverage_evidence": self.reader.mapping_scope_evidence,
+                "region_walk_budget_seconds": self.reader.max_seconds,
+                "region_walk_budget_count": self.reader.max_regions,
+                "discarded_exit_observations": 0,
+            })
         if not DARWIN:
-            self.peak.update(
-                {
-                    "pss_anon_peak_bytes": 0,
-                    "pss_shmem_peak_bytes": 0,
-                    "pss_file_peak_bytes": 0,
-                    "nvml_peak_bytes": 0,
-                    "nvml_available": self.reader.nvml is not None,
-                    "nvml_counted": self.reader.count_nvml,
-                }
-            )
+            self.peak.update({"nvml_available": self.reader.nvml is not None, "nvml_counted": self.reader.count_nvml})
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -344,61 +432,163 @@ class Sampler:
         try:
             process = self.psutil.Process(self.root)
             return [process.pid] + [child.pid for child in process.children(recursive=True)]
-        except Exception:
+        except self.psutil.NoSuchProcess:
+            return []
+        except self.psutil.Error as error:
+            self.peak["invalid_samples"] += 1
+            self.peak["coverage_errors"].append(public_error(error))
             return []
 
     def _run(self) -> None:
-        started = time.time()
-        parts = ("pss_anon", "pss_shmem", "pss_file", "nvml")
+        try:
+            self._sample_loop()
+        except Exception as error:
+            self.peak["invalid_samples"] += 1
+            self.peak["coverage_errors"].append(public_error(error))
+
+    def _darwin_observation(self, pid: int) -> tuple[dict | None, bool, dict | None]:
+        """Discard only typed exit races backed by an owned process identity.
+
+        ESRCH alone is insufficient: an unreadable live task, an exec, or an
+        unconfirmed identity must still invalidate coverage. Retain all timeout,
+        permission and observer-control errors even if the process later exits.
+        """
+        process = None
+        try:
+            process = self.psutil.Process(pid)
+            process.create_time()  # Cache identity before the observation.
+        except self.psutil.NoSuchProcess:
+            return None, False, {"pid": pid, "evidence": "absent_before_read"}
+        except self.psutil.Error:
+            process = None
+        value = self.reader.read(pid)
+        unavailable = (self.reader.last_target_unavailable if value is None
+                       else value.get("target_unavailable", False))
+        if unavailable and process is not None:
+            evidence = None
+            try:
+                if not process.is_running():
+                    evidence = "original_process_exited_or_pid_reused"
+                elif process.status() == self.psutil.STATUS_ZOMBIE:
+                    evidence = "original_process_is_zombie"
+            except self.psutil.NoSuchProcess:
+                evidence = "original_process_no_longer_exists"
+            except self.psutil.Error:
+                pass
+            if evidence:
+                return None, False, {
+                    "pid": pid, "create_time": process.create_time(),
+                    "evidence": evidence,
+                    "errors": [self.reader.last_error] if value is None else value["errors"],
+                    "incomplete_observation": value,
+                }
+        return value, value is None, None
+
+    def _sample_loop(self) -> None:
+        started = previous = time.perf_counter()
         while not self.stop_event.is_set():
-            footprint = rss = 0
-            components = dict.fromkeys(parts, 0)
+            now = time.perf_counter()
+            self.peak["max_sample_gap_seconds"] = max(self.peak["max_sample_gap_seconds"], now - previous)
+            previous = now
             gpu = {} if DARWIN else self.reader.gpu_bytes()
-            for pid in self._pids():
-                value = self.reader.read(pid) if DARWIN else self.reader.read(pid, gpu)
-                if not value:
-                    continue
-                footprint += value["fp"]
-                rss += value["rss"]
-                for key in parts:
-                    components[key] += value.get(key, 0)
-                self.peak["lifetime_max_footprint_bytes"] = max(
-                    self.peak["lifetime_max_footprint_bytes"], value["lifetime_max"]
-                )
-            if footprint:
-                self.peak["process_tree_footprint_peak_bytes"] = max(
-                    self.peak["process_tree_footprint_peak_bytes"], footprint
-                )
+            pids = self._pids()
+            self.sample_process_count = len(pids)
+            values = []
+            missing = []
+            discarded = []
+            for pid in pids:
+                if DARWIN:
+                    value, unreadable, exit_observation = self._darwin_observation(pid)
+                    if exit_observation is not None:
+                        discarded.append(exit_observation)
+                    if unreadable:
+                        missing.append(pid)
+                        if self.reader.last_error:
+                            self.peak["coverage_errors"] = sorted(set(
+                                self.peak["coverage_errors"] + [self.reader.last_error]))
+                else:
+                    value = self.reader.read(pid, gpu)
+                if value is not None:
+                    value["pid"] = pid
+                    self.processes_seen.add(pid)
+                    values.append(value)
+                elif not DARWIN and self.psutil.pid_exists(pid):
+                    try:
+                        if self.psutil.Process(pid).status() != self.psutil.STATUS_ZOMBIE:
+                            missing.append(pid)
+                    except self.psutil.NoSuchProcess:
+                        pass
+            if values:
+                raw = sum(value["fp"] for value in values)
+                rss = sum(value["rss"] for value in values)
+                if DARWIN:
+                    from memory_darwin import combine_samples
+                    bounds = combine_samples(values)
+                else:
+                    bounds = {"valid": True, "lower_bytes": raw, "upper_bytes": raw}
+                bounds["valid"] &= not missing
+                row = {"t": now - started, "raw_footprint_bytes": raw, "rss_bytes": rss,
+                       "memory": bounds, "processes": values, "missing_live_pids": missing,
+                       "discarded_exit_observations": discarded}
+                self.peak["raw_process_tree_footprint_peak_bytes"] = max(self.peak["raw_process_tree_footprint_peak_bytes"], raw)
                 self.peak["peak_rss_bytes"] = max(self.peak["peak_rss_bytes"], rss)
-                if not DARWIN:
-                    for key in parts:
-                        peak_key = f"{key}_peak_bytes"
-                        self.peak[peak_key] = max(self.peak[peak_key], components[key])
                 self.peak["samples"] += 1
-                row = {"t": round(time.time() - started, 2), "fp": footprint, "rss": rss}
-                if not DARWIN:
-                    row.update(components)
-                self.timeline.write(json.dumps(row, separators=(",", ":")) + "\n")
-                self.timeline.flush()
-            self.stop_event.wait(self.interval)
+                if bounds["valid"]:
+                    for endpoint in ("lower", "upper"):
+                        key = f"memory_peak_{endpoint}_bytes"
+                        self.peak[key] = max(self.peak[key], bounds[f"{endpoint}_bytes"])
+                else:
+                    self.peak["invalid_samples"] += 1
+                errors = [error for value in values for error in value.get("errors", [])]
+                if missing:
+                    errors.append("live process unreadable")
+                self.peak["coverage_errors"] = sorted(set(self.peak["coverage_errors"] + errors))
+                self._write_observation(row, now)
+            elif missing:
+                self.peak["invalid_samples"] += 1
+                self.peak["coverage_errors"] = sorted(set(self.peak["coverage_errors"] + ["live process unreadable"]))
+            if discarded:
+                self.peak["discarded_exit_observations"] += len(discarded)
+            if not values and (missing or discarded):
+                self._write_observation({
+                    "t": now - started, "processes": [], "missing_live_pids": missing,
+                    "discarded_exit_observations": discarded,
+                    "observation_status": "no_complete_process_observation",
+                }, now)
+            self.stop_event.wait(max(0, self.interval - (time.perf_counter() - now)))
+
+    def _write_observation(self, row: dict, started: float) -> None:
+        elapsed = time.perf_counter() - started
+        self.peak["observer_seconds"] += elapsed
+        row["observer_seconds"] = elapsed
+        self.timeline.write(json.dumps(row, separators=(",", ":")) + "\n")
+        self.timeline.flush()
 
     def stop(self) -> dict[str, Any]:
         self.stop_event.set()
-        self.thread.join(timeout=5)
+        timeout = 5
+        if DARWIN:
+            timeout += self.sample_process_count * self.reader.max_seconds
+        self.thread.join(timeout=timeout)
         if self.thread.is_alive():
             raise RuntimeError("memory sampler failed to stop")
         self.timeline.close()
-        method = "proc_pid_rusage v4 phys_footprint" if DARWIN else "smaps_rollup PSS"
-        if not DARWIN and self.reader.count_nvml:
-            method += " plus NVML"
-        self.peak["method"] = method + "; 0.2 s polling; summed process tree"
-        self.peak["valid"] = self.peak["samples"] > 0
+        self.peak["valid"] = self.peak["samples"] > 0 and self.peak["invalid_samples"] == 0
+        self.peak["interval_seconds"] = self.interval
+        self.peak["root_pid"] = self.root
+        self.peak["processes_seen"] = sorted(self.processes_seen)
+        self.peak["method"] = ("concurrent ledger/mapped-storage interval; overlap unknown"
+                               if DARWIN else "concurrent process-tree PSS plus discrete NVML")
+        if not DARWIN and not self.reader.count_nvml:
+            self.peak["metric_version"] = "linux-pss-v1"
+            self.peak["method"] = "concurrent process-tree PSS; NVML excluded by operator"
         if not DARWIN:
             self.peak["nvml_errors"] = self.reader.errors
             self.peak["read_failures"] = self.reader.read_failures
             self.peak["valid"] &= not self.reader.count_nvml or (
-                self.reader.nvml is not None and not self.reader.errors
-            )
+                self.reader.nvml is not None and not self.reader.errors)
+        if not self.peak["valid"]:
+            self.peak["memory_peak_lower_bytes"] = self.peak["memory_peak_upper_bytes"] = None
         write_json(self.out, self.peak)
         return dict(self.peak)
 
@@ -497,7 +687,7 @@ class AntflyServer:
                 env=env,
                 start_new_session=True,
             )
-            if sample:
+            if sample and memory_sampling_enabled():
                 self.sampler = Sampler(self.proc.pid, self.out_dir, self.tag)
             ready = wait_http(self.proc, self.port, "/healthz", timeout_s, self.log.name, started)
         except Exception:
@@ -511,11 +701,11 @@ class AntflyServer:
         }
 
     def stop(self) -> dict[str, Any]:
-        stop_proc(self.proc)
         try:
             return self.sampler.stop() if self.sampler else {}
         finally:
             self.sampler = None
+            stop_proc(self.proc)
             if self.log is not None and not self.log.closed:
                 self.log.close()
 
@@ -569,11 +759,12 @@ def python_arm_env() -> dict[str, str]:
 
 
 def run_python_arm(script: str, argv: list[str], out: Path, tag: str) -> dict[str, Any]:
-    """Run an upstream implementation in a fresh sampled process."""
+    """Run an upstream implementation, retaining its result if cleanup fails."""
     log = out / f"{tag}.py.log"
     sampler = None
     process = None
     stdout = ""
+    footprint, cleanup_errors = {}, []
     with log.open("w", encoding="utf-8") as stderr:
         try:
             process = subprocess.Popen(
@@ -584,12 +775,24 @@ def run_python_arm(script: str, argv: list[str], out: Path, tag: str) -> dict[st
                 text=True,
                 start_new_session=True,
             )
-            sampler = Sampler(process.pid, out, tag)
+            if memory_sampling_enabled():
+                sampler = Sampler(process.pid, out, tag)
             stdout, _ = process.communicate()
         finally:
-            if process is not None and process.poll() is None:
-                stop_proc(process)
-            footprint = sampler.stop() if sampler else {}
+            try:
+                footprint = sampler.stop() if sampler else {}
+            except Exception as error:
+                message = public_error(error)
+                cleanup_errors.append(message)
+                footprint = {**sampler.peak, "valid": False,
+                             "memory_peak_lower_bytes": None, "memory_peak_upper_bytes": None,
+                             "coverage_errors": [*sampler.peak.get("coverage_errors", []), message]}
+            finally:
+                if process is not None and process.poll() is None:
+                    try:
+                        stop_proc(process)
+                    except Exception as error:
+                        cleanup_errors.append(public_error(error))
     try:
         info = json.loads(stdout.strip().splitlines()[-1])
     except Exception:
@@ -597,11 +800,17 @@ def run_python_arm(script: str, argv: list[str], out: Path, tag: str) -> dict[st
             "error": f"python arm rc={None if process is None else process.returncode}; see {log.name}",
             "footprint": footprint,
             "rc": None if process is None else process.returncode,
+            **({"cleanup_errors": cleanup_errors} if cleanup_errors else {}),
         }
     info["footprint"] = footprint
     info["rc"] = process.returncode
     if process.returncode != 0 and "error" not in info:
         info["error"] = f"python arm exited {process.returncode}; see {log.name}"
+    if cleanup_errors:
+        info["cleanup_errors"] = cleanup_errors
+        messages = [info["error"]] if info.get("error") else []
+        messages.append("cleanup failed: " + "; ".join(cleanup_errors))
+        info["error"] = "; ".join(messages)
     return info
 
 
@@ -633,7 +842,7 @@ def benchmark_complete(
     lifecycles: int,
     expected_calls_per_lifecycle: int | None = None,
 ) -> bool:
-    """Require every arm/lifecycle and every expected measured call to have succeeded."""
+    """Require complete execution records, allowing explicitly recorded request refusals."""
     lifecycle_rows = load_jsonl(out / "lifecycles.jsonl")
     call_rows = load_jsonl(out / "calls.jsonl")
     expected = {(arm, lifecycle) for arm in expected_arms for lifecycle in range(lifecycles)}
@@ -651,5 +860,5 @@ def benchmark_complete(
     ):
         return False
     return bool(call_rows) and expected <= observed and expected <= set(call_groups) and all(
-        row.get("ok") is True for row in call_rows
+        row.get("ok") is True or call_refused(row) for row in call_rows
     )

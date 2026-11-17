@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "conditional_source_scope",
+  "scope": "Original model-loader POSIX file mappings and unlinked regular-file storage in the owned process tree, combined with the observed footprint ledger using an overlap interval. Not arbitrary Apple driver aliases, total physical RAM, a touched working set, or minimum required RAM.",
+  "binding_requirement": "Before selecting posix-mmap-top-level, retain the actual executable hashes, reference package versions and source/build identities. These source policies do not automatically attest replacement binaries, locally modified packages, different revisions or driver internals.",
+  "framework_reference": {
+    "torch_version": "2.15.0",
+    "torch_reported_source_commit": "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e",
+    "safetensors_version": "0.8.0",
+    "safetensors_source_commit": "a406ca3e7a90598be0cd05a50069cb9bf5ef6ba6",
+    "policy": "safetensors initially maps the file through memmap2 for metadata. Its PyTorch mmap backend creates torch.UntypedStorage.from_file(shared=False); PyTorch MapAllocator uses ordinary mmap MAP_PRIVATE and owns the mapping. safetensors retains its active storage in Arc<Storage>; Torch tensors retain their storage. The optional pread backend reads rather than retaining an original-file mapping. The MPS fast path copies source bytes into an owned Shared MTLBuffer and hands it to PyTorch through DLPack; a source checkpoint mapping is not evidence that the destination allocation aliases it. No original model-file submap is explicitly constructed by these loader paths.",
+    "sources": [
+      "https://github.com/safetensors/safetensors/blob/a406ca3e7a90598be0cd05a50069cb9bf5ef6ba6/bindings/python/src/lib.rs#L650-L825",
+      "https://github.com/safetensors/safetensors/blob/a406ca3e7a90598be0cd05a50069cb9bf5ef6ba6/bindings/python/src/lib.rs#L1195-L1255",
+      "https://github.com/safetensors/safetensors/blob/a406ca3e7a90598be0cd05a50069cb9bf5ef6ba6/bindings/python/src/metal.rs#L61-L91",
+      "https://github.com/pytorch/pytorch/blob/d0f2af8b66b20da4baa50644c0cd3f887a2eae2e/aten/src/ATen/MapAllocator.cpp#L330-L400"
+    ]
+  },
+  "llama_cpp_reference": {
+    "source_commit": "5266f24da75dc449bd56cbed7addb9c8e4a6a73e",
+    "policy": "The decoder loader uses ordinary read-only MAP_SHARED mmap when mmap is enabled. Mapped fragments are owned by llama_mmap; model-owned mapped-buffer storage takes ownership of loader mappings. Copied tensor storage is separate from original-file residency. The media/projector loader reads weight bytes into host/backend tensor buffers, using a temporary vector and backend upload when the destination is not host-accessible; it must not be described as the same mmap policy as the decoder.",
+    "sources": [
+      "https://github.com/ggml-org/llama.cpp/blob/5266f24da75dc449bd56cbed7addb9c8e4a6a73e/src/llama-mmap.cpp#L464-L515",
+      "https://github.com/ggml-org/llama.cpp/blob/5266f24da75dc449bd56cbed7addb9c8e4a6a73e/src/llama-model-loader.cpp#L1403-L1434",
+      "https://github.com/ggml-org/llama.cpp/blob/5266f24da75dc449bd56cbed7addb9c8e4a6a73e/src/llama-model.cpp#L1823-L1837",
+      "https://github.com/ggml-org/llama.cpp/blob/5266f24da75dc449bd56cbed7addb9c8e4a6a73e/tools/mtmd/clip.cpp#L3603-L3625"
+    ]
+  },
+  "whisper_cpp_reference": {
+    "source_commit": "306c88f4d1286aec1bf96e544632897886af5501",
+    "policy": "The file initializer opens a binary std::ifstream, feeds loader.read through fin.read and closes the input stream. It is a copied-weight loader, not a persistent checkpoint mmap. Shared Metal buffers own host allocations and wrap them with newBufferWithBytesNoCopy; private buffers use newBufferWithLength. These are allocation-ledger observations, not original GGML-file residency. Closed Metal allocation charging remains an explicit measurement limitation.",
+    "sources": [
+      "https://github.com/ggml-org/whisper.cpp/blob/306c88f4d1286aec1bf96e544632897886af5501/src/whisper.cpp#L3624-L3665",
+      "https://github.com/ggml-org/whisper.cpp/blob/306c88f4d1286aec1bf96e544632897886af5501/ggml/src/ggml-metal/ggml-metal-device.m#L1631-L1669"
+    ]
+  },
+  "limitations": [
+    "Source mapping provenance alone does not validate a runtime residency query, kernel vnode identity, live process identity, walk completeness or snapshot consistency.",
+    "A Metal NoCopy wrapper does not establish that ledger bytes and file-backed resident pages are disjoint. Retain overlap bounds and observed components; do not add independent maxima or mapped lengths.",
+    "Driver-created aliases or allocations outside the observed ledger and retained loader mappings are not attested. A valid scoped interval is not a complete physical-memory demand estimate."
+  ]
+}

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
@@ -78,7 +80,7 @@ WORKLOADS: dict[str, dict[str, Any]] = {
         "script": "whisper_bench.py",
         "script_args": [],
         "arms": {"antfly": "antfly", "transformers": "transformers", "whisper.cpp": "whisper.cpp"},
-        "cells": {"short": 1},
+        "cells": {"short": 1, "medium": 1, "long": 1},
     },
     "ocr": {
         "workload": "ocr",
@@ -92,48 +94,56 @@ WORKLOADS: dict[str, dict[str, Any]] = {
 }
 
 
-def selected_cells(spec: dict, only_cell: str | None) -> dict[str, int]:
+def selected_cells(spec: dict, only_cell: str | None, repetitions: int = 10) -> dict[str, int]:
     cells = spec["cells"]
-    if only_cell is None:
-        return dict(cells)
-    if only_cell not in cells:
+    if only_cell is not None and only_cell not in cells:
         raise ValueError(f"unknown cell {only_cell!r} for {spec['model_key']}")
-    return {only_cell: cells[only_cell]}
+    multiplier = repetitions if spec.get("workload") in {"whisper", "ocr"} else 1
+    return {cell: count * multiplier for cell, count in cells.items() if only_cell is None or cell == only_cell}
 
 
-def lifecycle_ok(row: dict) -> bool:
-    return not row.get("error") and row.get("rc", 0) == 0 and row.get("status", "ok") in {"ok", "complete"}
+def aggregate_status(statuses) -> str:
+    values = set(statuses)
+    return next(iter(values)) if len(values) == 1 else "partial" if values else "failed"
 
 
-def provider_completeness(
-    run: Path,
-    arm: str,
-    cells: dict[str, int],
-    lifecycles: int,
-) -> tuple[bool, list[str]]:
+def cell_completion(run: Path, arm: str, cell: str, expected_calls: int, lifecycles: int) -> dict:
     lifecycle_rows = [row for row in C.load_jsonl(run / "lifecycles.jsonl") if row.get("arm") == arm]
-    calls = [row for row in C.load_jsonl(run / "calls.jsonl") if row.get("arm") == arm]
-    reasons: list[str] = []
-    expected_lifecycles = set(range(lifecycles))
-    observed_lifecycles = [int(row.get("lc", -1)) for row in lifecycle_rows]
-    if len(lifecycle_rows) != lifecycles or set(observed_lifecycles) != expected_lifecycles:
+    calls = [row for row in C.load_jsonl(run / "calls.jsonl") if row.get("arm") == arm and row.get("cell") == cell]
+    reasons = []
+    expected = set(range(lifecycles))
+    if len(lifecycle_rows) != lifecycles or {row.get("lc") for row in lifecycle_rows} != expected:
         reasons.append("missing or duplicate lifecycle record")
-    if any(not lifecycle_ok(row) for row in lifecycle_rows):
-        reasons.append("failed lifecycle")
-    expected_groups = {(cell, lifecycle) for cell in cells for lifecycle in expected_lifecycles}
-    observed_groups: dict[tuple[str, int], list[dict]] = {}
+    for lifecycle in expected:
+        rows = [row for row in calls if row.get("lc") == lifecycle]
+        if len(rows) != expected_calls:
+            reasons.append(f"lifecycle {lifecycle}: expected {expected_calls} calls, recorded {len(rows)}")
+        identifiers = [(row.get("k"), row.get("repetition")) for row in rows]
+        if len(set(identifiers)) != len(identifiers):
+            reasons.append(f"lifecycle {lifecycle}: duplicate call identifiers")
+    if any(row.get("lc") not in expected for row in calls):
+        reasons.append("unexpected lifecycle")
+    refused = [row for row in calls if C.call_refused(row)]
+    failed = [row for row in calls if row.get("ok") is not True and not C.call_refused(row)]
     for row in calls:
-        key = (str(row.get("cell")), int(row.get("lc", -1)))
-        observed_groups.setdefault(key, []).append(row)
-    if set(observed_groups) != expected_groups:
-        reasons.append("missing or unexpected cell measurement")
-    for cell, lifecycle in expected_groups:
-        rows = observed_groups.get((cell, lifecycle), [])
-        if len(rows) != cells[cell]:
-            reasons.append(f"{cell} lifecycle {lifecycle} call count incomplete")
-        elif any(row.get("ok") is not True for row in rows):
-            reasons.append(f"{cell} lifecycle {lifecycle} contains a failed call")
-    return not reasons, list(dict.fromkeys(reasons))
+        if row.get("ok") is True:
+            if row.get("warmup_state", "complete") != "complete":
+                reasons.append("successful call without completed per-cell warmup")
+            value = row.get("ms")
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                reasons.append("invalid successful-call duration")
+    if failed:
+        reasons.append("unclassified failed calls")
+    status = "failed" if reasons else "refused" if len(refused) == len(calls) else "failed" if refused else "complete"
+    if refused and len(refused) != len(calls):
+        reasons.append("mixed success/refusal across requests; no complete-cell ratio")
+    return {"status": status, "expected_calls": expected_calls * lifecycles, "recorded_calls": len(calls),
+            "successful_calls": sum(row.get("ok") is True for row in calls),
+            "refused_calls": len(refused), "failed_calls": len(failed),
+            "reasons": list(dict.fromkeys(reasons)),
+            **({"refusals": list({json.dumps({"status": row["status"], "error": row["response_error"]}, sort_keys=True):
+                                  {"status": row["status"], "error": row["response_error"]} for row in refused}.values())} if refused else {})}
+
 
 
 def metric_entry(entry: dict) -> dict:
@@ -153,214 +163,230 @@ def metric_entry(entry: dict) -> dict:
 
 
 def recorded_agreement(analysis: dict, cells: dict[str, int], lifecycles: int) -> dict[str, list[dict]]:
-    recorded = analysis.get("agreement", {}).get("recorded") or []
-    by_cell: dict[str, list[dict]] = {}
-    for row in recorded:
-        cell = row.get("cell")
-        if cell in cells:
-            by_cell.setdefault(cell, []).append(row)
-    complete = {}
-    for cell in cells:
-        rows = by_cell.get(cell, [])
-        if (
-            len(rows) == lifecycles
-            and {int(row.get("lc", -1)) for row in rows} == set(range(lifecycles))
-            and all(row.get("complete") is True for row in rows)
-        ):
-            complete[cell] = rows
-    return complete
+    by_cell = {}
+    for row in analysis.get("agreement", {}).get("recorded", []):
+        if row.get("cell") in cells:
+            by_cell.setdefault(row["cell"], []).append(row)
+    return {cell: rows for cell, rows in by_cell.items()
+            if {row.get("lc") for row in rows} == set(range(lifecycles))
+            and all(row.get("complete") is True for row in rows)}
+
+
+def practical_category(ratio: float) -> str:
+    if 1 / 1.05 <= ratio <= 1.05:
+        return "practical_tie"
+    return "antfly_faster" if ratio > 1.05 else "reference_faster"
+
+
+def provider_step(spec: dict, provider: str, phase: str, outcomes: dict, metrics: dict) -> dict:
+    step = {"workload": spec["workload"], "model": spec["model"], "provider": provider, "phase": phase,
+            "status": aggregate_status(value["status"] for value in outcomes.values()), "cells": outcomes}
+    if metrics:
+        step["metrics"] = {"cells": metrics}
+    if step["status"] == "failed":
+        step["error"] = "; ".join(f"{cell}: {reason}" for cell, value in outcomes.items()
+                                  for reason in value.get("reasons", [])) or "no complete measurements"
+    return step
 
 
 def speed_summary(root: Path, key: str, spec: dict, cells: dict[str, int], lifecycles: int) -> tuple[list[dict], list[dict]]:
     run = root / "speed" / key
     analysis = analyze.summarize_run(run)
-    C.write_json(run / "summary.json", [analysis])
-    complete_by_arm = {}
-    steps = []
+    if run.is_dir():
+        C.write_json(run / "summary.json", [analysis])
+    outcomes, steps = {}, []
     for arm, provider in spec["arms"].items():
-        complete, reasons = provider_completeness(run, arm, cells, lifecycles)
-        complete_by_arm[arm] = complete
-        metrics = {}
-        if complete:
-            for cell in cells:
-                entry = analysis.get("cells", {}).get(cell, {}).get(arm)
+        outcomes[arm], metrics = {}, {}
+        for cell, count in cells.items():
+            outcome = cell_completion(run, arm, cell, count, lifecycles)
+            entry = analysis.get("cells", {}).get(cell, {}).get(arm)
+            if outcome["status"] == "complete":
                 if not entry or len(entry.get("lifecycles", [])) != lifecycles:
-                    complete = False
-                    reasons.append(f"{cell} analyzed lifecycle metrics incomplete")
-                    metrics = {}
-                    break
-                metrics[cell] = metric_entry(entry)
-        complete_by_arm[arm] = complete
-        step = {
-            "workload": spec["workload"],
-            "model": spec["model"],
-            "provider": provider,
-            "phase": "speed",
-            "status": "complete" if complete else "failed",
-        }
-        if complete:
-            step["metrics"] = {"cells": metrics}
-        else:
-            step["error"] = "; ".join(dict.fromkeys(reasons)) or "incomplete speed measurements"
-        steps.append(step)
+                    outcome["status"] = "failed"
+                    outcome["reasons"].append("analyzed lifecycle metrics incomplete")
+                else:
+                    metrics[cell] = metric_entry(entry)
+            outcomes[arm][cell] = outcome
+        steps.append(provider_step(spec, provider, "speed", outcomes[arm], metrics))
     comparisons = []
     recorded = recorded_agreement(analysis, cells, lifecycles)
     for cell in cells:
         cell_data = analysis.get("cells", {}).get(cell, {})
-        for pair, values in (cell_data.get("_comparisons") or {}).items():
+        for pair, values in cell_data.get("_comparisons", {}).items():
             first, second = pair.split("_vs_", 1)
-            if not complete_by_arm.get(first) or not complete_by_arm.get(second):
+            if (outcomes.get(first, {}).get(cell, {}).get("status") != "complete"
+                    or outcomes.get(second, {}).get(cell, {}).get("status") != "complete"
+                    or values.get("lifecycles") != lifecycles):
                 continue
-            if values.get("lifecycles") != lifecycles:
-                continue
+            comparison = {"workload": spec["workload"], "model": spec["model"], "cell": cell, "phase": "speed",
+                          "providers": [spec["arms"][first], spec["arms"][second]], "metrics": values,
+                          "practical_category": practical_category(values["p50_ratio"]["median"]),
+                          "tie_policy": {"multiplicative_margin": 0.05, "statistical_significance_claimed": False}}
             agreement = analysis.get("agreement", {}).get(pair, {}).get(cell)
-            if key == "gemma4" and (
-                agreement is None
-                or agreement.get("inputs") != cells[cell]
-                or agreement.get("same_prompt_tokens") != 1.0
-            ):
-                continue
-            comparison = {
-                "workload": spec["workload"],
-                "model": spec["model"],
-                "cell": cell,
-                "providers": [spec["arms"][first], spec["arms"][second]],
-                "metrics": values,
-            }
-            if key == "whisper" and spec["arms"][second] == "whisper.cpp":
-                comparison["qualified_metrics"] = comparison.pop("metrics")
-                comparison["qualification"] = {
-                    "directly_comparable": False,
-                    "reason": (
-                        "whisper.cpp measures fresh-process first-inference compute with model load excluded, "
-                        "while Antfly is server-resident and warmed"
-                    ),
-                }
             if agreement is not None:
                 comparison["agreement"] = agreement
+            if cell in recorded:
+                comparison["recorded_agreement"] = recorded[cell]
+            if key == "gemma4":
+                comparison["prompt_parity"] = {"http_token_ids_observed": False,
+                    "count_equality_is_not_token_identity": True, "diagnostics": "prompt_comparisons.json"}
             comparisons.append(comparison)
-        if cell in recorded and all(complete_by_arm.values()):
-            comparisons.append(
-                {
-                    "workload": spec["workload"],
-                    "model": spec["model"],
-                    "cell": cell,
-                    "providers": list(spec["arms"].values()),
-                    "agreement": recorded[cell],
-                }
-            )
     return steps, comparisons
 
 
 def footprint_metric(lifecycle: dict) -> dict | None:
     footprint = lifecycle.get("footprint") or {}
-    peak = footprint.get("process_tree_footprint_peak_bytes")
-    if footprint.get("valid") is not True or not isinstance(peak, int) or peak <= 0:
+    lower, upper = footprint.get("memory_peak_lower_bytes"), footprint.get("memory_peak_upper_bytes")
+    if (footprint.get("valid") is not True or type(lower) is not int or type(upper) is not int
+            or not 0 < lower <= upper):
         return None
-    metric = {
-        "process_tree_footprint_peak_bytes": peak,
-        "peak_rss_bytes": footprint.get("peak_rss_bytes"),
-        "method": footprint.get("method"),
-    }
-    return {key: value for key, value in metric.items() if value is not None}
+    return {key: value for key, value in footprint.items() if key in {
+        "metric_version", "memory_peak_lower_bytes", "memory_peak_upper_bytes",
+        "raw_process_tree_footprint_peak_bytes", "peak_rss_bytes", "method", "samples", "invalid_samples",
+        "observer_seconds", "max_sample_gap_seconds", "interval_seconds", "coverage_errors", "coverage_scope", "coverage_evidence",
+        "nvml_available", "nvml_counted", "nvml_errors", "read_failures"}}
 
 
-def memory_summary(root: Path, key: str, spec: dict, cells: dict[str, int]) -> list[dict]:
+def spread(values: list[float | int]) -> dict:
+    return {"median": statistics.median(values), "min": min(values), "max": max(values)}
+
+
+def memory_summary(root: Path, key: str, spec: dict, cells: dict[str, int], lifecycles: int = 3) -> list[dict]:
     steps = []
     for arm, provider in spec["arms"].items():
-        metrics = {}
-        reasons = []
-        for cell, expected_calls in cells.items():
+        metrics, outcomes = {}, {}
+        for cell, count in cells.items():
             run = root / "memory" / key / cell
-            complete, cell_reasons = provider_completeness(run, arm, {cell: expected_calls}, 1)
-            lifecycles = [row for row in C.load_jsonl(run / "lifecycles.jsonl") if row.get("arm") == arm]
-            footprint = footprint_metric(lifecycles[0]) if len(lifecycles) == 1 else None
-            if not complete or footprint is None:
-                reasons.extend(f"{cell}: {reason}" for reason in cell_reasons)
-                if footprint is None:
-                    reasons.append(f"{cell}: memory sampler incomplete")
-                continue
-            metrics[cell] = footprint
-        complete = len(metrics) == len(cells)
-        step = {
-            "workload": spec["workload"],
-            "model": spec["model"],
-            "provider": provider,
-            "phase": "memory",
-            "status": "complete" if complete else "failed",
-        }
-        if complete:
-            step["metrics"] = {"cells": metrics, "isolation": "one cell per fresh process lifecycle"}
-        else:
-            step["error"] = "; ".join(dict.fromkeys(reasons)) or "incomplete isolated-memory measurements"
-        steps.append(step)
+            outcome = cell_completion(run, arm, cell, count, lifecycles)
+            rows = sorted((row for row in C.load_jsonl(run / "lifecycles.jsonl") if row.get("arm") == arm),
+                          key=lambda row: row["lc"])
+            observations = [footprint_metric(row) for row in rows]
+            if outcome["status"] == "complete":
+                if len(observations) != lifecycles or any(value is None for value in observations):
+                    outcome["status"] = "failed"
+                    outcome["reasons"].append("memory sampler incomplete or coverage invalid")
+                elif len({value["metric_version"] for value in observations}) != 1:
+                    outcome["status"] = "failed"
+                    outcome["reasons"].append("inconsistent memory metric versions")
+                else:
+                    metrics[cell] = {
+                        "metric_version": observations[0]["metric_version"], "lifecycles": observations,
+                        "memory_peak_lower_bytes": spread([value["memory_peak_lower_bytes"] for value in observations]),
+                        "memory_peak_upper_bytes": spread([value["memory_peak_upper_bytes"] for value in observations]),
+                        "isolation": "one cell per fresh process lifecycle"}
+            outcomes[cell] = outcome
+        steps.append(provider_step(spec, provider, "memory", outcomes, metrics))
     return steps
 
 
 def memory_comparisons(steps: list[dict], spec: dict, cells: dict[str, int]) -> list[dict]:
-    by_provider = {step["provider"]: step for step in steps if step["status"] == "complete"}
-    antfly = by_provider.get("antfly")
-    if antfly is None:
-        return []
+    by_provider = {step["provider"]: step for step in steps}
+    antfly = by_provider.get("antfly", {}).get("metrics", {}).get("cells", {})
     comparisons = []
     for provider in spec["arms"].values():
-        if provider == "antfly" or provider not in by_provider:
+        if provider == "antfly":
             continue
-        for cell in cells:
-            antfly_peak = antfly["metrics"]["cells"][cell]["process_tree_footprint_peak_bytes"]
-            reference_peak = by_provider[provider]["metrics"]["cells"][cell]["process_tree_footprint_peak_bytes"]
-            comparisons.append(
-                {
-                    "workload": spec["workload"],
-                    "model": spec["model"],
-                    "cell": cell,
-                    "phase": "memory",
-                    "providers": ["antfly", provider],
-                    "metrics": {
-                        "antfly_peak_bytes": antfly_peak,
-                        "reference_peak_bytes": reference_peak,
-                        "reference_to_antfly_ratio": reference_peak / antfly_peak,
-                        "isolation": "one cell per fresh process lifecycle",
-                    },
-                }
-            )
+        reference = by_provider.get(provider, {}).get("metrics", {}).get("cells", {})
+        for cell in cells.keys() & antfly.keys() & reference.keys():
+            first, second = antfly[cell], reference[cell]
+            if first["metric_version"] != second["metric_version"]:
+                continue
+            lower = second["memory_peak_lower_bytes"]["median"] / first["memory_peak_upper_bytes"]["median"]
+            upper = second["memory_peak_upper_bytes"]["median"] / first["memory_peak_lower_bytes"]["median"]
+            metrics = {"reference_to_antfly_ratio_interval": {"lower": lower, "upper": upper},
+                       "antfly": {key: first[key] for key in ("memory_peak_lower_bytes", "memory_peak_upper_bytes")},
+                       "reference": {key: second[key] for key in ("memory_peak_lower_bytes", "memory_peak_upper_bytes")},
+                       "metric_version": first["metric_version"]}
+            if lower == upper:
+                metrics["reference_to_antfly_ratio"] = lower
+            comparisons.append({"workload": spec["workload"], "model": spec["model"], "cell": cell,
+                                "phase": "memory", "providers": ["antfly", provider], "metrics": metrics})
     return comparisons
 
 
-def build_summary(
-    root: Path,
-    keys: list[str],
-    phases: set[str],
-    lifecycles: int,
-    only_cell: str | None = None,
-) -> dict:
+def write_gliner_quality(root: Path, key: str, lifecycles: int, only_cell: str | None) -> None:
+    spec = WORKLOADS[key]
+    cells = selected_cells(spec, only_cell)
+    run = root / "speed" / key
+    analysis = analyze.summarize_run(run)
+    agreement = analysis.get("agreement", {}).get("antfly_vs_py", {})
+    providers = {}
+    for arm, provider in spec["arms"].items():
+        outcomes = {cell: cell_completion(run, arm, cell, count, lifecycles) for cell, count in cells.items()}
+        providers[provider] = {"status": aggregate_status(value["status"] for value in outcomes.values()), "cells": outcomes}
+    for cell in cells:
+        paired = agreement.get(cell, {}).get("paired_inputs", 0)
+        expected_inputs = sum(row.get("n_inputs", 0) for row in C.load_jsonl(run / "calls.jsonl")
+                              if row.get("arm") == "antfly" and row.get("cell") == cell)
+        if any(providers[provider]["cells"][cell]["status"] != "complete" for provider in providers):
+            continue
+        if paired != expected_inputs or expected_inputs == 0:
+            for provider in providers:
+                providers[provider]["cells"][cell]["status"] = "failed"
+                providers[provider]["cells"][cell]["reasons"].append("structured output pairing incomplete")
+                providers[provider]["status"] = aggregate_status(value["status"] for value in providers[provider]["cells"].values())
+    C.write_json(root / "quality" / key / "result.json", {
+        "schema_version": 1, "model": spec["model"], "status": aggregate_status(row["status"] for row in providers.values()),
+        "providers": providers, "comparisons": agreement,
+        "provenance": {"basis": "all measured structured outputs, paired by lifecycle/call/item/input digest",
+                       "scope": "cross-provider labels/spans/classifications/relations agreement, not labeled task accuracy"}})
+
+
+def quality_summary(root: Path, key: str, spec: dict) -> tuple[list[dict], list[dict]]:
+    path = root / "quality" / key / "result.json"
+    result = json.loads(path.read_text()) if path.is_file() else {}
+    providers = result.get("providers", {})
+    steps = []
+    for provider in spec["arms"].values():
+        metrics = providers.get(provider, {})
+        status = metrics.get("status", "complete" if metrics and result.get("status") == "complete" else "failed")
+        step = {"workload": spec["workload"], "model": spec["model"], "provider": provider, "phase": "quality",
+                "status": status, "evidence": f"quality/{key}/result.json"}
+        if metrics:
+            step["metrics"] = metrics
+        if status != "complete":
+            step["error"] = metrics.get("error", result.get("error", "quality evidence missing or incomplete"))
+        steps.append(step)
+    return steps, [{"workload": spec["workload"], "model": spec["model"], "phase": "quality",
+                    "providers": list(providers), "evidence": f"quality/{key}/result.json",
+                    "metrics": result.get("comparisons", {}), "provenance": result.get("provenance", {})}] if providers else []
+
+
+def build_summary(root: Path, keys: list[str], phases: set[str], lifecycles: int, only_cell: str | None = None,
+                  memory_lifecycles: int = 3, repetitions: int = 10) -> dict:
     steps, comparisons = [], []
     for key in keys:
         spec = WORKLOADS[key]
-        cells = selected_cells(spec, only_cell)
+        cells = selected_cells(spec, only_cell, repetitions)
         if "speed" in phases:
-            speed_steps, speed_comparisons = speed_summary(root, key, spec, cells, lifecycles)
-            steps.extend(speed_steps)
-            comparisons.extend(speed_comparisons)
+            values, pairs = speed_summary(root, key, spec, cells, lifecycles)
+            steps.extend(values)
+            comparisons.extend(pairs)
         if "memory" in phases:
-            memory_steps = memory_summary(root, key, spec, cells)
-            steps.extend(memory_steps)
-            comparisons.extend(memory_comparisons(memory_steps, spec, cells))
-    complete = bool(steps) and all(step["status"] == "complete" for step in steps)
-    return {"status": "complete" if complete else "failed", "steps": steps, "comparisons": comparisons}
+            values = memory_summary(root, key, spec, cells, memory_lifecycles)
+            steps.extend(values)
+            comparisons.extend(memory_comparisons(values, spec, cells))
+        if "quality" in phases:
+            values, pairs = quality_summary(root, key, spec)
+            steps.extend(values)
+            comparisons.extend(pairs)
+    return {"status": aggregate_status(step["status"] for step in steps), "steps": steps, "comparisons": comparisons}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--key", action="append", choices=sorted(WORKLOADS), required=True)
-    parser.add_argument("--phase", action="append", choices=("speed", "memory"), required=True)
+    parser.add_argument("--phase", action="append", choices=("speed", "memory", "quality"), required=True)
     parser.add_argument("--lifecycles", type=int, default=3)
+    parser.add_argument("--memory-lifecycles", type=int, default=3)
+    parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--only-cell")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     try:
-        summary = build_summary(args.run, args.key, set(args.phase), args.lifecycles, args.only_cell)
+        summary = build_summary(args.run, args.key, set(args.phase), args.lifecycles, args.only_cell,
+                                args.memory_lifecycles, args.repetitions)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         summary = {"status": "failed", "steps": [], "comparisons": [], "error": C.public_error(exc)}
     encoded = json.dumps(summary, ensure_ascii=False, separators=(",", ":")) + "\n"

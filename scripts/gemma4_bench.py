@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import base64
 import http.client
+import hashlib
 import json
+import math
 import os
 import shutil
+import re
 import subprocess
+import struct
 import sys
 import time
 from pathlib import Path
@@ -71,6 +75,180 @@ def public_verified_files(files: dict) -> dict:
             for key in FILES
         },
     }
+
+
+def gguf_inventory(path: Path) -> dict:
+    """Read tensor descriptors, not tensor payloads or the tokenizer vocabulary."""
+    types = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
+             8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
+             13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 30: "BF16"}
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with path.open("rb") as handle:
+        def unpack(fmt):
+            size = struct.calcsize("<" + fmt)
+            data = handle.read(size)
+            if len(data) != size:
+                raise ValueError("truncated GGUF header")
+            return struct.unpack("<" + fmt, data)[0]
+
+        def string(keep=False):
+            length = unpack("Q")
+            if length > path.stat().st_size - handle.tell():
+                raise ValueError("invalid GGUF string length")
+            if keep:
+                return handle.read(length).decode("utf-8")
+            handle.seek(length, 1)
+
+        def skip(kind):
+            if kind == 8:
+                string()
+            elif kind == 9:
+                element, count = unpack("I"), unpack("Q")
+                if element in sizes:
+                    handle.seek(sizes[element] * count, 1)
+                else:
+                    for _ in range(count):
+                        skip(element)
+            elif kind in sizes:
+                handle.seek(sizes[kind], 1)
+            else:
+                raise ValueError(f"unsupported GGUF metadata type {kind}")
+
+        if handle.read(4) != b"GGUF":
+            raise ValueError("not a GGUF checkpoint")
+        version = unpack("I")
+        if version not in (2, 3):
+            raise ValueError(f"unsupported GGUF version {version}")
+        tensors, metadata = unpack("Q"), unpack("Q")
+        for _ in range(metadata):
+            string()
+            skip(unpack("I"))
+        counts, heads = {}, {}
+        for _ in range(tensors):
+            name = string(True)
+            dimensions = unpack("I")
+            shape = [unpack("Q") for _ in range(dimensions)]
+            kind = unpack("I")
+            unpack("Q")  # Data offset; payloads are intentionally not read.
+            label = types.get(kind, f"GGML_TYPE_{kind}")
+            row = counts.setdefault(label, {"tensors": 0, "parameters": 0})
+            row["tensors"] += 1
+            row["parameters"] += math.prod(shape)
+            if name in ("token_embd.weight", "output.weight", "output_norm.weight"):
+                heads[name] = {"storage_type": label, "shape": shape}
+        if handle.tell() > path.stat().st_size:
+            raise ValueError("truncated GGUF tensor descriptors")
+    return {"gguf_version": version, "tensor_count": tensors, "storage_types": counts,
+            "embedding_and_output_tensors": heads,
+            "scope": "checkpoint storage, not runtime arithmetic or KV dtype"}
+
+
+def loading_evidence(server, files: dict, arm: str) -> dict:
+    log_path = Path(server.log.name) if arm == "llama" else server.out_dir / f"{server.tag}.server.log"
+    excerpts = []
+    if log_path.exists():
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if re.search(r"(type\s+\w+:|KV.*(type|size)|cache.*(type|dtype)|mmap|model buffer size|mmproj|projector)", line, re.I):
+                excerpts.append(C.public_error(line)[:400])
+    return {
+        "checkpoints": public_verified_files(files),
+        "tensor_inventory": {key: gguf_inventory(files[key]["path"]) for key in FILES},
+        "requested_kv": {"key": "f16", "value": "f16", "prompt_cache": False},
+        "native_source_policy": C.native_precision(server.binary, MODEL, models_dir=GEN_MODELS_DIR)["native_policy"] if arm == "antfly" else None,
+        "mmap": {"launch_override": None, "observed_log_lines": excerpts[:60],
+                 "note": "No mmap override is passed; source policy and observed logs are distinct from resident bytes."},
+        "projector": {"file": files["mmproj"]["name"], "sha256": files["mmproj"]["sha256"],
+                      "llama_flag": "--mmproj", "native_selection": "model manifest"},
+    }
+
+
+def prompt_fingerprints(prompt: str, tokens: list[int] | None = None) -> dict:
+    """Retain identity evidence, never the diagnostic prompt or token sequence."""
+    data = prompt.encode("utf-8")
+    evidence = {"rendered_prompt_sha256": hashlib.sha256(data).hexdigest(),
+                "rendered_prompt_bytes": len(data)}
+    if tokens is not None:
+        encoded = json.dumps(tokens, separators=(",", ":")).encode("ascii")
+        evidence.update(prompt_token_ids_sha256=hashlib.sha256(encoded).hexdigest(),
+                        prompt_token_count=len(tokens))
+    return evidence
+
+
+def llama_prompt_evidence(port: int, payload: dict) -> dict:
+    """Observe llama's formatting/tokenizer endpoints, outside timed operations."""
+    client = C.Client(port)
+    try:
+        status, rendered, _ = client.post("/apply-template", {
+            "messages": payload["messages"], "add_generation_prompt": True,
+            "chat_template_kwargs": payload["chat_template_kwargs"],
+        })
+        if status != 200 or not isinstance(rendered.get("prompt"), str):
+            return {"status": "unavailable", "apply_template_http_status": status}
+        prompt = rendered["prompt"]
+        status, encoded, _ = client.post("/tokenize", {
+            "content": prompt, "add_special": True, "parse_special": True,
+        })
+        ids = encoded.get("tokens")
+        if status != 200 or not isinstance(ids, list) or any(type(x) is not int for x in ids):
+            return {"status": "unavailable", **prompt_fingerprints(prompt), "tokenize_http_status": status,
+                    "scope": "diagnostic endpoints, not an HTTP generation input trace"}
+        return {"status": "observed", "source": "llama.cpp /apply-template + /tokenize",
+                **prompt_fingerprints(prompt, ids),
+                "scope": "diagnostic endpoints, not an HTTP generation input trace"}
+    except Exception as exc:
+        return {"status": "unavailable", "error": C.public_error(exc)}
+    finally:
+        client.conn.close()
+
+
+def parse_native_prompt(text: str) -> dict:
+    ids = re.search(r"(?m)^prompt_token_ids:([^\n]*)", text)
+    rendered = re.search(r"(?ms)^prompt:\n(.*?)\nprompt_token_ids:", text)
+    if ids is None or rendered is None:
+        return {"status": "unavailable", "reason": "CLI did not emit rendering and prompt IDs"}
+    try:
+        tokens = [int(value) for value in ids.group(1).split()]
+    except ValueError:
+        return {"status": "unavailable", "reason": "invalid CLI prompt token-ID output"}
+    return {"status": "observed", "source": "antfly inference generate CLI diagnostic",
+            **prompt_fingerprints(rendered.group(1), tokens),
+            "scope": "CLI pre-media-expansion encoding, NOT observed HTTP generation token IDs"}
+
+
+def native_prompt_evidence(binary: Path, call: dict) -> dict:
+    argv = [str(binary), "inference", "generate", str(model_dir()), call["text"],
+            "--backend", C.ANTFLY_BACKEND, "--max-tokens", "1", "--temperature", "0",
+            "--cache-dtype", "f16", "--disable-thinking", "--ignore-eos",
+            "--print-prompt", "--print-prompt-token-ids"]
+    for key in ("image", "audio"):
+        if call.get(key):
+            argv.extend(["--" + key, str(C.MEDIA / call[key])])
+    env = dict(os.environ)
+    env.pop("ANTFLY_INFERENCE_SERVER_URL", None)
+    env.pop("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER", None)
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=900, env=env)
+        observed = parse_native_prompt(result.stdout + "\n" + result.stderr)
+        observed["exit_code"] = result.returncode
+        observed["diagnostic_settings"] = {"backend": C.ANTFLY_BACKEND, "max_tokens": 1,
+                                           "temperature": 0, "enable_thinking": False, "cache_dtype": "f16",
+                                           "scope": "separate CLI operation; timed HTTP calls retain their original token caps"}
+        observed["binary"] = C.file_identity(binary)
+        return observed
+    except Exception as exc:
+        return {"status": "unavailable", "error": type(exc).__name__}
+
+
+def compare_prompts(native: dict, reference: dict) -> dict:
+    observed = native.get("status") == reference.get("status") == "observed"
+    return {"diagnostic_token_ids_equal": (
+                native["prompt_token_ids_sha256"] == reference["prompt_token_ids_sha256"]
+                and native["prompt_token_count"] == reference["prompt_token_count"]) if observed else None,
+            "diagnostic_rendering_equal": (
+                native["rendered_prompt_sha256"] == reference["rendered_prompt_sha256"]
+                and native["rendered_prompt_bytes"] == reference["rendered_prompt_bytes"]) if observed else None,
+            "http_generation_prompt_parity": "unproven",
+            "note": "Counts do not establish prompt parity; CLI and tokenizer diagnostics are not HTTP input traces."}
 
 
 def make_cells(only: str | None = None) -> list[dict]:
@@ -162,8 +340,10 @@ def stream(port: int, path: str, payload: dict, timeout: float = 900) -> dict:
     started = time.perf_counter()
     try:
         return _stream(port, path, payload, timeout)
+    except C.HttpResponseError as exc:
+        return {**exc.call_fields(), "ms": (time.perf_counter() - started) * 1000}
     except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-        return {"status": -1, "err": C.public_error(exc), "ms": (time.perf_counter() - started) * 1000}
+        return {"ok": False, "status": -1, "error": C.public_error(exc), "ms": (time.perf_counter() - started) * 1000}
 
 
 def _stream(port: int, path: str, payload: dict, timeout: float) -> dict:
@@ -173,9 +353,13 @@ def _stream(port: int, path: str, payload: dict, timeout: float) -> dict:
     connection.request("POST", path, body=data, headers={"content-type": "application/json", "accept": "text/event-stream"})
     response = connection.getresponse()
     if response.status != 200:
-        error = response.read()[:400].decode(errors="replace")
+        body = response.read()
         connection.close()
-        return {"status": response.status, "err": error, "ms": (time.perf_counter() - started) * 1000}
+        try:
+            body = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        raise C.HttpResponseError(response.status, body)
     text, reasoning = [], []
     usage = timings = first_token = finish = None
     deltas = 0
@@ -235,6 +419,10 @@ class LlamaServer:
             "--image-max-tokens",
             str(IMAGE_MAX_TOKENS),
             "--jinja",
+            "-ctk",
+            "f16",
+            "-ctv",
+            "f16",
             "--no-cache-prompt",
             "-cram",
             "0",
@@ -253,7 +441,8 @@ class LlamaServer:
         started = time.perf_counter()
         try:
             self.process = subprocess.Popen(self.argv, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
-            self.sampler = C.Sampler(self.process.pid, self.out, self.tag)
+            if C.memory_sampling_enabled():
+                self.sampler = C.Sampler(self.process.pid, self.out, self.tag)
             ready = C.wait_http(self.process, self.port, "/health", 300, self.log.name, started)
         except Exception:
             self.stop()
@@ -261,11 +450,11 @@ class LlamaServer:
         return {"ready_s": ready, "command": C.public_command(self.argv)}
 
     def stop(self) -> dict:
-        C.stop_proc(self.process)
         try:
             return self.sampler.stop() if self.sampler else {}
         finally:
             self.sampler = None
+            C.stop_proc(self.process)
             if not self.log.closed:
                 self.log.close()
 
@@ -273,6 +462,12 @@ class LlamaServer:
 def llama_version(binary: str) -> str:
     process = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30, check=False)
     return " ".join((process.stdout + process.stderr).split())[:300]
+
+
+def warmup_observation(response: dict) -> dict:
+    return {"state": "complete" if response["status"] == 200 else "refused" if C.call_refused(response) else "failed",
+            "status": response["status"], "ms": response["ms"],
+            **{key: response[key] for key in ("error", "response_error") if key in response}}
 
 
 def run_arm(args, arm: str, files: dict, cells: list[dict], out: Path, lifecycle: int) -> dict:
@@ -292,71 +487,123 @@ def run_arm(args, arm: str, files: dict, cells: list[dict], out: Path, lifecycle
         )
         endpoint = "/ai/v1/generate"
         info = {"arm": arm, "binary": C.public_path(args.antfly)}
+        info["precision"] = C.native_precision(args.antfly, MODEL, models_dir=GEN_MODELS_DIR)
     else:
         server = LlamaServer(args.llama_server, files, out, tag)
         endpoint = "/v1/chat/completions"
         info = {"arm": arm, "provider": "llama.cpp", "binary": Path(args.llama_server).name, "version": llama_version(args.llama_server)}
+        info["precision"] = {"implementation": "llama.cpp", "binary": C.file_identity(Path(shutil.which(args.llama_server) or args.llama_server)),
+                             "policy": "GGUF mixed tensor storage; no single floating-point parameter dtype",
+                             "requested_kv": {"key": "f16", "value": "f16"},
+                             "compute_dtype": "not directly observed; do not infer from checkpoint type"}
     info["host_before"] = C.host_snapshot()
     info.update(server.start())
     calls = C.JsonlWriter(out / "calls.jsonl")
     outputs = C.JsonlWriter(out / "outputs.jsonl") if lifecycle == 0 else None
     try:
+        if arm == "llama" and lifecycle == 0:
+            evidence = []
+            for cell in cells:
+                call = cell["calls"][0]
+                reference = llama_prompt_evidence(server.port, request_body(call, cell, arm))
+                evidence.append({"cell": cell["id"], "k": 0, "reference": reference})
+            C.write_json(out / "llama_prompt_evidence.json", evidence)
         first = stream(server.port, endpoint, request_body(cells[0]["calls"][0], cells[0], arm))
         info["first_call_ms"] = round(first["ms"], 2)
         info["first_call_status"] = first["status"]
         if first["status"] != 200:
-            info["first_call_error"] = first.get("err")
+            info["first_call_error"] = first.get("error")
+        info["warmups"] = {}
+        info["cell_wall_s"] = {}
         for cell in cells:
-            for index in range(cell["warmup"]):
-                stream(server.port, endpoint, request_body(cell["calls"][index % len(cell["calls"])], cell, arm))
-            cell_started = time.perf_counter()
-            rows = [stream(server.port, endpoint, request_body(call, cell, arm)) for call in cell["calls"]]
-            cell_wall = time.perf_counter() - cell_started
-            for index, result in enumerate(rows):
-                usage = result.get("usage") or {}
-                output_tokens = usage.get("completion_tokens")
-                ok = result["status"] == 200 and output_tokens == cell["max_tokens"]
-                error = result.get("err") or (None if ok else f"completion_tokens={output_tokens} != {cell['max_tokens']}")
-                decode_seconds = result.get("decode_s")
-                calls.write(
-                    {
-                        "arm": arm,
-                        "model": MODEL_KEY,
-                        "lc": lifecycle,
-                        "cell": cell["id"],
-                        "k": index,
-                        "n_inputs": 1,
-                        "words": len(cell["calls"][index]["text"].split()),
-                        "ms": round(result["ms"], 3),
-                        "ok": ok,
-                        "status": result["status"],
-                        "err": error,
-                        "cell_wall_s": round(cell_wall, 4),
-                        "ttft_ms": None if result.get("ttft_ms") is None else round(result["ttft_ms"], 3),
-                        "decode_tok_s": round((output_tokens - 1) / decode_seconds, 2) if ok and decode_seconds else None,
-                        "prompt_tokens": usage.get("prompt_tokens"),
-                        "completion_tokens": output_tokens,
-                        "engine_timings": result.get("engine_timings"),
-                    }
-                )
-                if outputs is not None and result["status"] == 200:
-                    outputs.write(
+            warmup = {"state": "complete", "calls": []}
+            info["warmups"][cell["id"]] = warmup
+            if cell is cells[0]:
+                warmup["calls"].append({"role": "first_call", **warmup_observation(first)})
+                warmup["state"] = warmup["calls"][-1]["state"]
+            measuring = False
+            try:
+                if warmup["state"] != "failed":
+                    for index in range(cell["warmup"]):
+                        response = stream(server.port, endpoint, request_body(cell["calls"][index % len(cell["calls"])], cell, arm))
+                        observation = warmup_observation(response)
+                        warmup["calls"].append(observation)
+                        if observation["state"] != "complete":
+                            warmup["state"] = observation["state"]
+                        if observation["state"] == "failed":
+                            break
+                if warmup["state"] == "failed":
+                    continue
+                # Refusal is retained as such; measured requests are independent attempts.
+                measuring = True
+                cell_started = time.perf_counter()
+                for index, call in enumerate(cell["calls"]):
+                    result = stream(server.port, endpoint, request_body(call, cell, arm))
+                    usage = result.get("usage") or {}
+                    output_tokens = usage.get("completion_tokens")
+                    ok = result["status"] == 200 and output_tokens == cell["max_tokens"]
+                    error = result.get("error") or (None if ok else f"completion_tokens={output_tokens} != {cell['max_tokens']}")
+                    decode_seconds = result.get("decode_s")
+                    calls.write(
                         {
                             "arm": arm,
+                            "model": MODEL_KEY,
+                            "lc": lifecycle,
                             "cell": cell["id"],
                             "k": index,
-                            "text": result["text"],
-                            "ref": cell["calls"][index].get("ref"),
-                            "reasoning": result["reasoning"][:2000],
+                            "n_inputs": 1,
+                            "words": len(call["text"].split()),
+                            "ms": round(result["ms"], 3),
+                            "ok": ok,
+                            "status": result["status"],
+                            "err": error,
+                            "response_error": result.get("response_error"),
+                            "warmup_state": warmup["state"],
+                            "ttft_ms": None if result.get("ttft_ms") is None else round(result["ttft_ms"], 3),
+                            "decode_tok_s": round((output_tokens - 1) / decode_seconds, 2) if ok and decode_seconds else None,
                             "prompt_tokens": usage.get("prompt_tokens"),
+                            "completion_tokens": output_tokens,
+                            "engine_timings": result.get("engine_timings"),
                         }
                     )
+                    if outputs is not None and result["status"] == 200:
+                        outputs.write(
+                            {
+                                "arm": arm,
+                                "lc": lifecycle,
+                                "cell": cell["id"],
+                                "k": index,
+                                "text": result["text"],
+                                "ref": call.get("ref"),
+                                "reasoning": result["reasoning"][:2000],
+                                "prompt_tokens": usage.get("prompt_tokens"),
+                            }
+                        )
+                info["cell_wall_s"][cell["id"]] = round(time.perf_counter() - cell_started, 4)
+            except Exception as exc:
+                if not measuring:
+                    warmup.update(state="failed", error=C.public_error(exc))
+                info.setdefault("cell_errors", {})[cell["id"]] = C.public_error(exc)
+                info["error"] = "; ".join(info["cell_errors"].values())
     finally:
         calls.close()
         if outputs is not None:
             outputs.close()
-        info["host_after"] = C.host_snapshot()
-        info["footprint"] = server.stop()
+        for field, observe in (
+            ("host_after", C.host_snapshot),
+            ("footprint", server.stop),
+            ("weight_loading", lambda: loading_evidence(server, files, arm)),
+        ):
+            try:
+                info[field] = observe()
+            except Exception as exc:
+                info.setdefault("teardown_errors", {})[field] = C.public_error(exc)
+        if info.get("teardown_errors"):
+            info["error"] = "; ".join(filter(None, [info.get("error"), *info["teardown_errors"].values()]))
+        if arm == "llama" and "weight_loading" in info:
+            info["precision"]["observed_storage"] = info["weight_loading"]["tensor_inventory"]
+            info["precision"]["launch_flags"] = info.get("command")
+            info["precision"]["observed_loading_logs"] = info["weight_loading"]["mmap"]["observed_log_lines"]
     return info
 
 
@@ -368,6 +615,11 @@ def orchestrate(args) -> bool:
     C.prepare_output(out)
     C.write_json(out / "model_files.json", public_verified_files(files))
     cells = make_cells(args.only_cell)
+    native_prompts = [
+        {"cell": cell["id"], "k": 0, "native": native_prompt_evidence(args.antfly, cell["calls"][0])}
+        for cell in cells
+    ]
+    C.write_json(out / "native_prompt_evidence.json", native_prompts)
     arms = ["antfly", "llama"]
     metadata = C.JsonlWriter(out / "lifecycles.jsonl")
     try:
@@ -392,6 +644,13 @@ def orchestrate(args) -> bool:
                 print(f"done {arm} in {info['wall_s']}s" + (f" ERROR {info['error']}" if "error" in info else ""), flush=True)
     finally:
         metadata.close()
+    reference_path = out / "llama_prompt_evidence.json"
+    if reference_path.exists():
+        references = {row["cell"]: row["reference"] for row in json.loads(reference_path.read_text())}
+        C.write_json(out / "prompt_comparisons.json", [
+            {"cell": row["cell"], **compare_prompts(row["native"], references.get(row["cell"], {}))}
+            for row in native_prompts
+        ])
     expected_calls = sum(len(cell["calls"]) for cell in cells)
     return C.benchmark_complete(out, set(arms), args.lifecycles, expected_calls)
 

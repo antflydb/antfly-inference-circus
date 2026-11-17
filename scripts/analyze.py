@@ -52,7 +52,9 @@ def summarize_run(run: Path) -> dict:
             for row in rows:
                 if row.get("ok") is not True:
                     errors[(row.get("err") or "")[:140]] += 1
-            if len(ok) != len(rows) or not ok:
+            if len(ok) != len(rows) or not ok or any(
+                not isinstance(row.get("ms"), (int, float)) or not math.isfinite(row["ms"]) or row["ms"] <= 0 for row in ok
+            ):
                 continue
             elapsed = [float(row["ms"]) for row in ok]
             items = sum(int(row["n_inputs"]) for row in ok)
@@ -179,17 +181,20 @@ def summarize_run(run: Path) -> dict:
                     "required_backend",
                     "first_call_status",
                     "first_call_error",
+                    "precision",
+                    "weight_backing",
+                    "cache_probe",
+                    "decoding",
+                    "warmup",
+                    "warmups",
+                    "repetitions",
+                    "command",
+                    "config",
+                    "loading",
                 )
             }
             | {
-                "footprint_peak_bytes": (lifecycle.get("footprint") or {}).get("process_tree_footprint_peak_bytes"),
-                "footprint_valid": (lifecycle.get("footprint") or {}).get("valid"),
-                "rss_peak_bytes": (lifecycle.get("footprint") or {}).get("peak_rss_bytes"),
-                **{
-                    key: value
-                    for key, value in (lifecycle.get("footprint") or {}).items()
-                    if key.startswith(("pss_", "nvml_")) or key == "method"
-                },
+                "footprint": lifecycle.get("footprint"),
                 "load1": (lifecycle.get("quiet") or {}).get("load1"),
             }
             for lifecycle in lifecycles
@@ -213,59 +218,48 @@ def agreement(run: Path) -> dict:
         results.update(text_agreement(outputs))
     elif outputs:
         indexed = collections.defaultdict(dict)
+        duplicates = set()
         for output in outputs:
-            indexed[(output["cell"], output["k"], output["j"])][output["arm"]] = output["o"]
+            key = (output["cell"], output["lc"], output["k"], output["j"])
+            if output["arm"] in indexed[key]:
+                duplicates.add(key)
+            indexed[key][output["arm"]] = output
         arms = {output["arm"] for output in outputs}
         for first, second in PAIRS:
             if first not in arms or second not in arms:
                 continue
-            per_cell = collections.defaultdict(lambda: {"span_f1": [], "cls_match": [], "rel_f1": []})
-            for (cell, _call, _item), values in indexed.items():
-                if first not in values or second not in values:
+            per_cell = collections.defaultdict(lambda: {"span_f1": [], "cls_match": [], "rel_f1": [],
+                "exact_entity_inputs": 0, "exact_structured_inputs": 0, "expected_inputs": 0, "invalid_or_unpaired_inputs": 0})
+            for key, values in indexed.items():
+                if not ({first, second} & values.keys()):
                     continue
-                left, right = values[first], values[second]
+                cell = key[0]
                 metrics = per_cell[cell]
-                metrics["span_f1"].append(f1([entity[:3] for entity in left["e"]], [entity[:3] for entity in right["e"]]))
-                if left["c"] or right["c"]:
-                    canonical = lambda value: {  # noqa: E731
-                        key: sorted(labels) if isinstance(labels, list) else ([labels] if labels is not None else [])
-                        for key, labels in value.items()
-                    }
-                    metrics["cls_match"].append(float(canonical(left["c"]) == canonical(right["c"])))
-                if left["r"] or right["r"]:
-                    metrics["rel_f1"].append(f1(left["r"], right["r"]))
-            results[f"{first}_vs_{second}"] = {
-                cell: {
-                    key: round(statistics.mean(values), 4) if values else None
-                    for key, values in metrics.items()
-                }
-                | {
-                    "inputs": len(metrics["span_f1"]),
-                    "exact_inputs": sum(value == 1.0 for value in metrics["span_f1"]),
-                }
-                for cell, metrics in per_cell.items()
-            }
-    vectors = load_jsonl(run / "vectors.jsonl")
-    if vectors:
-        indexed = collections.defaultdict(dict)
-        for vector in vectors:
-            indexed[(vector["cell"], vector["k"], vector["j"])][vector["arm"]] = vector["v"]
-        arms = {vector["arm"] for vector in vectors}
-        for first, second in PAIRS:
-            if first not in arms or second not in arms:
-                continue
-            per_cell = collections.defaultdict(list)
-            for (cell, _call, _item), values in indexed.items():
-                if first not in values or second not in values:
+                metrics["expected_inputs"] += 1
+                left_row, right_row = values.get(first, {}), values.get(second, {})
+                left, right = left_row.get("o"), right_row.get("o")
+                if (key in duplicates or not isinstance(left, dict) or not isinstance(right, dict)
+                        or not left_row.get("input_sha256") or left_row["input_sha256"] != right_row.get("input_sha256")):
+                    metrics["invalid_or_unpaired_inputs"] += 1
                     continue
-                left, right = values[first], values[second]
-                left_norm = math.sqrt(sum(value * value for value in left))
-                right_norm = math.sqrt(sum(value * value for value in right))
-                per_cell[cell].append(sum(x * y for x, y in zip(left, right)) / (left_norm * right_norm))
+                entities_left, entities_right = [entity[:3] for entity in left["e"]], [entity[:3] for entity in right["e"]]
+                span = f1(entities_left, entities_right)
+                metrics["span_f1"].append(span)
+                canonical = lambda value: {key: sorted(labels) if isinstance(labels, list) else ([labels] if labels is not None else [])
+                                           for key, labels in value.items()}
+                classification = canonical(left["c"]) == canonical(right["c"])
+                relations = f1(left["r"], right["r"])
+                if left["c"] or right["c"]:
+                    metrics["cls_match"].append(float(classification))
+                if left["r"] or right["r"]:
+                    metrics["rel_f1"].append(relations)
+                metrics["exact_entity_inputs"] += span == 1.0
+                metrics["exact_structured_inputs"] += span == 1.0 and classification and relations == 1.0
             results[f"{first}_vs_{second}"] = {
-                cell: {"min_cos": round(min(values), 6), "mean_cos": round(statistics.mean(values), 6), "n": len(values)}
-                for cell, values in per_cell.items()
-            }
+                cell: {key: statistics.mean(values) if values else None for key, values in metrics.items() if isinstance(values, list)}
+                | {key: value for key, value in metrics.items() if not isinstance(value, list)}
+                | {"paired_inputs": len(metrics["span_f1"])}
+                for cell, metrics in per_cell.items()}
     recorded = load_jsonl(run / "agreement.jsonl")
     if recorded:
         results["recorded"] = recorded
@@ -297,13 +291,13 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
 def text_agreement(outputs: list[dict]) -> dict:
     indexed = collections.defaultdict(dict)
     for output in outputs:
-        indexed[(output["cell"], output["k"])][output["arm"]] = output
+        indexed[(output["cell"], output["lc"], output["k"], output.get("repetition"))][output["arm"]] = output
     results = {}
     for first, second in PAIRS:
         per_cell = collections.defaultdict(
             lambda: {"exact": [], "prefix_share": [], "same_prompt_tokens": [], f"wer_{first}": [], f"wer_{second}": []}
         )
-        for (cell, _call), values in indexed.items():
+        for (cell, _lifecycle, _call, _repetition), values in indexed.items():
             if first not in values or second not in values:
                 continue
             left, right = values[first]["text"], values[second]["text"]
@@ -328,7 +322,8 @@ def text_agreement(outputs: list[dict]) -> dict:
                     "prefix_share_median": round(statistics.median(metrics["prefix_share"]), 4),
                 }
                 | (
-                    {"same_prompt_tokens": round(statistics.mean(metrics["same_prompt_tokens"]), 4)}
+                    {"equal_prompt_token_count_fraction": round(statistics.mean(metrics["same_prompt_tokens"]), 4),
+                     "token_identity_proven": False}
                     if metrics["same_prompt_tokens"]
                     else {}
                 )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -222,27 +223,46 @@ def request_body(model_id: str, texts: list[str], cell: dict) -> dict:
     }
 
 
+def output_rows(arm: str, model: str, lifecycle: int, cell: dict, call: int,
+                texts: list[str], data, status: int, error: str | None):
+    """Keep failures in the same per-input denominator as successful extractions."""
+    ok = error is None and status == 200 and isinstance(data, list) and len(data) == len(texts)
+    for index, text in enumerate(texts):
+        yield {
+            "arm": arm, "model": model, "lc": lifecycle, "cell": cell["id"], "k": call, "j": index,
+            "input_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "status": status, "err": error,
+            "o": (normalize_antfly(data[index], text) if arm == "antfly"
+                  else normalize_python(data[index], cell["schema"])) if ok else None,
+        }
+
+
 def run_antfly(args, cells: list[dict], out: Path, lifecycle: int) -> dict:
     model_id = MODELS[args.model]
     server = C.AntflyServer(args.antfly, out, f"lc{lifecycle}-antfly")
     info = {"arm": "antfly", "binary": C.public_path(args.antfly), "host_before": C.host_snapshot()}
     info.update(server.start())
     calls = C.JsonlWriter(out / "calls.jsonl")
-    outputs = C.JsonlWriter(out / "outputs.jsonl") if lifecycle == 0 else None
+    outputs = C.JsonlWriter(out / "outputs.jsonl")
     try:
         client = C.Client(server.port)
         started = time.perf_counter()
-        status, body, _ = client.post("/ai/v1/extract", request_body(model_id, cells[0]["calls"][0], cells[0]))
+        status, body = None, {}
+        try:
+            status, body, _ = client.post("/ai/v1/extract", request_body(model_id, cells[0]["calls"][0], cells[0]))
+        except Exception as error:
+            info["first_call_error"] = C.public_error(error)
         info["first_call_ms"] = round((time.perf_counter() - started) * 1000, 2)
         info["first_call_status"] = status
-        if status != 200:
-            info["first_call_error"] = json.dumps(body, ensure_ascii=False)[:400]
+        if status is not None and status != 200:
+            info["first_call_error"] = C.api_error(body)
+        info["precision"] = C.native_precision(args.antfly, model_id)
         for cell in cells:
-            for index in range(cell["warmup"]):
-                C.Client(server.port).post(
-                    "/ai/v1/extract",
-                    request_body(model_id, cell["calls"][index % len(cell["calls"])], cell),
-                )
+            warmup_state = C.http_warmup(client, "/ai/v1/extract",
+                (request_body(model_id, cell["calls"][index % len(cell["calls"])], cell)
+                 for index in range(cell["warmup"])), info, cell["id"])
+            if warmup_state == "failed":
+                continue
             client = C.Client(server.port)
             cell_started = time.perf_counter()
             rows = []
@@ -265,31 +285,23 @@ def run_antfly(args, cells: list[dict], out: Path, lifecycle: int) -> dict:
                         "lc": lifecycle,
                         "cell": cell["id"],
                         "k": index,
+                        "warmup_state": warmup_state,
                         "n_inputs": len(texts),
                         "words": word_count(texts),
                         "ms": round(elapsed_ms, 3),
                         "ok": ok,
                         "status": status,
+                        "response_error": C.api_error(body) if not ok else {},
                         "bytes": bytes_read,
                         "err": error,
                         "cell_wall_s": round(cell_wall, 4),
                     }
                 )
-                if outputs is not None and ok:
-                    for output_index, item in enumerate(data):
-                        outputs.write(
-                            {
-                                "arm": "antfly",
-                                "cell": cell["id"],
-                                "k": index,
-                                "j": output_index,
-                                "o": normalize_antfly(item, texts[output_index]),
-                            }
-                        )
+                for row in output_rows("antfly", args.model, lifecycle, cell, index, texts, data, status, error):
+                    outputs.write(row)
     finally:
         calls.close()
-        if outputs is not None:
-            outputs.close()
+        outputs.close()
         info["host_after"] = C.host_snapshot()
         info["footprint"] = server.stop()
     return info
@@ -320,9 +332,10 @@ def run_python(args, cells: list[dict], out: Path, lifecycle: int) -> dict:
         "type": type(model).__name__,
         "host_before": C.host_snapshot(),
     }
+    info["precision"] = C.reference_precision(model, default_policy="library_default")
     sync = C.torch_sync(torch)
     calls = C.JsonlWriter(out / "calls.jsonl")
-    outputs = C.JsonlWriter(out / "outputs.jsonl") if lifecycle == 0 else None
+    outputs = C.JsonlWriter(out / "outputs.jsonl")
 
     def call(texts, cell, schema):
         with torch.inference_mode():
@@ -377,21 +390,12 @@ def run_python(args, cells: list[dict], out: Path, lifecycle: int) -> dict:
                         "cell_wall_s": round(cell_wall, 4),
                     }
                 )
-                if outputs is not None and ok:
-                    for output_index, item in enumerate(result):
-                        outputs.write(
-                            {
-                                "arm": "py",
-                                "cell": cell["id"],
-                                "k": index,
-                                "j": output_index,
-                                "o": normalize_python(item, cell["schema"]),
-                            }
-                        )
+                for row in output_rows("py", args.model, lifecycle, cell, index, texts, result,
+                                       200 if ok else -1, error):
+                    outputs.write(row)
     finally:
         calls.close()
-        if outputs is not None:
-            outputs.close()
+        outputs.close()
     info["host_after"] = C.host_snapshot()
     info.update(C.torch_device_bytes(torch))
     return info

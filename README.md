@@ -19,8 +19,8 @@ The suite intentionally contains six logical models:
 | schema extraction | `fastino/gliner2.5-base-v1` | GLiNER2 2.1.0 |
 | typed decisions | `fastino/GLiNER2.5-Decide` | GLiNER2 2.1.0 |
 | multimodal generation | `google/gemma-4-E4B-it-qat-q4_0-gguf` | llama.cpp `b10809` |
-| speech transcription | `openai/whisper-small` | Transformers 5.22.2 and whisper.cpp 1.9.2 |
-| document OCR | `lightonai/LightOnOCR-3-0.8B` | Transformers 5.22.2 |
+| speech transcription | `openai/whisper-small` | Transformers 5.23.0 and whisper.cpp 1.9.2 |
+| document OCR | `lightonai/LightOnOCR-3-0.8B` | Transformers 5.23.0 |
 
 Each lifecycle starts fresh provider processes. Results retain cell-level
 latency, throughput, quality/agreement, memory, errors, and artifact
@@ -44,20 +44,115 @@ Transformers reads the pinned Hugging Face safetensors while whisper.cpp reads
 an F16 GGML conversion. Those files are provider-native representations of the
 same logical model, not byte-identical weights.
 
-Speed uses three fresh paired lifecycles by default; memory runs each cell
-alone in a separate fresh lifecycle. Antfly and Python references are warmed.
-whisper.cpp uses a fresh CLI process and reports its native total time minus
-model-load time: that remains cold first-inference compute, not warmed serving
-latency. Results retain that timing difference and do not present whisper.cpp
-as an unqualified warm speedup. Speech measures one short recording per
-operation; reference and server warmups remain outside the measured call.
+Speed uses three fresh paired lifecycles by default. Isolated memory uses
+three fresh lifecycles **per provider and cell**, retaining each observation
+and the median/minimum/maximum. Speech and OCR perform ten independent warmed
+requests per cell and lifecycle. Repetition increases measurement count, not
+workload size. All Whisper providers remain resident: whisper.cpp uses the
+pinned `whisper-server`, with real per-cell warmups excluded from timings.
+There is no cold CLI timing subtraction.
 
-Memory is sampled across the rooted process tree every 200 ms. Metal uses
-macOS `phys_footprint`; CUDA uses Linux `Pss_Anon + Pss_Shmem + Pss_File` plus
-per-process NVML device bytes. These are different platform yardsticks and
-must not be pooled across backends. Missing or invalid samples suppress the
-memory comparison. Quality and agreement remain separate measured outcomes,
-not claims of general model quality.
+Whisper has three distinct natural recordings: short (about 5.86 seconds),
+medium (15.115 seconds, `1272-128104-0011`), and long (29.4 seconds,
+`1272-128104-0004`). Durations are calculated from actual WAV samples. Each
+recording fits in one 30-second audio window; none is padded, concatenated,
+repeated, or assembled from multiple requests.
+
+Memory observations target a 200 ms interval without suspending the rooted
+process tree, only in isolated memory lifecycles. Darwin walks have a finite
+two-second allowance per process; actual observation cost and gaps are retained,
+so this is not a guaranteed 200 ms cadence or an unsampled lifetime maximum.
+Speed and task-quality runs do not start the observer. Direct per-workload
+instruments enable it only with `TERMITE_SAMPLE_MEMORY=1`; the top-level runner
+sets this by phase.
+CUDA uses concurrent Linux `Pss_Anon + Pss_Shmem + Pss_File` plus discrete
+per-process NVML device bytes (`linux-pss-nvml-v1`). Metal retains raw
+`phys_footprint` and observed resident mappings of the actual model artifacts
+and unlinked regular-file storage in the owned process tree. The latter includes
+temporary repacked weights: dirty file-backed pages need not enter the ledger.
+Because public unprivileged macOS APIs cannot prove ledger/mapped-page overlap,
+Metal reports an inclusive **interval**, not a fictitious exact sum
+(`darwin-ledger-mapped-storage-interval-v1`). If concurrent ledger bytes are
+`F` and measured unique mapped-storage residency lies in `[L,U]`, the inclusive
+result lies in `[max(F,L), F+U]`. Aliases and cross-process sharing widen it
+conservatively. Neither model file sizes nor independently peaked components
+are added to a peak.
+This is VM-object residency, including file-cache pages in mapped windows
+without a task PTE. It is not a touched-byte working set, minimum required
+RAM, or whole-machine demand estimate. File-cache warmth can affect it;
+the interval does not prove every mapped tensor was used.
+
+Opaque mappings, observer-budget exhaustion, live-process read failures, and
+other incomplete coverage invalidate the memory comparison rather than
+silently dropping bytes. `TERMITE_METAL_MAPPING_EVIDENCE` may document pinned
+source proof that active model and temporary-storage loaders retain ordinary
+top-level POSIX mappings; only that audited original-mapping scope permits
+ignoring opaque submaps. It does not attest Apple driver-created aliases or
+total physical RAM. Do not reuse proof for a different executable or loader revision.
+The source audits are retained in
+[`native_precision_contracts.json`](scripts/native_precision_contracts.json) and
+[`reference_mapping_contracts.json`](scripts/reference_mapping_contracts.json).
+They cover the named revisions, not arbitrary replacement binaries.
+Raw components, coverage, observation cost, sample gaps, and interval endpoints
+remain in the data. Ratios are intervals unless both endpoints coincide.
+These platform metrics must not be pooled across backends.
+
+Every provider/cell is `complete`, `refused`, or `failed`. A structured HTTP
+400/413/422 rejection is a request refusal, not a successful measurement or
+a claim about every possible request to that model. Missing operations,
+transport errors, and server failures remain failures. Completed sibling
+cells retain their results; refused cells remain visible without ratios.
+Provider/run `partial` status never means full workload support.
+Hard warmup failures skip that cell without fabricating measured requests.
+Structured warmup refusals remain refused warmups; already-planned independent
+measurements are actually attempted. A later successful response without a
+completed warmup does not become a valid warm-timing comparison. Quality
+failures retain attempted/successful/refused/missing task counts and request
+statuses; partial task coverage never becomes a full-subset accuracy score.
+
+Speed ratios retain exact values and observed lifecycle spread. A ratio in
+`[1/1.05,1.05]` is a practical tie, not a significance test.
+
+### Quality and precision evidence
+
+The default run includes task-quality diagnostics, separately from timing and
+memory. Setup downloads public frozen inputs; checks and measurements are
+offline. Each quality module records source revisions/hashes, sample IDs,
+scoring policy, denominators, and provider differences in a compact
+`quality/<model>/result.json`:
+
+| Model | Evidence and limits |
+| --- | --- |
+| Embedding | Every timed vector is paired, not a sample. Frozen BEIR/SciFact: 24 queries, 256 candidates including all positive judgments; Recall@1/5/10 and full-rank MRR. Restricted-candidate diagnostic, not a full BEIR score. |
+| GLiNER / Decide | All timed lifecycle/call/item outputs, paired by input digest: entity spans/labels, classification, and relations. Agreement is not labeled task accuracy. |
+| Whisper | 32 frozen natural LibriSpeech recordings: micro WER/CER and per-recording errors for all three providers. |
+| Gemma 4 | First 12 test examples each from GSM8K and ARC-Challenge: scored math/science accuracy with original denominators, failed responses, and paired differences. Small text-only diagnostics, not multimodal or full-benchmark accuracy. |
+| OCR | First 16 CORD-v2 test receipt images: raw WER/CER plus separately named markup/text-normalized diagnostics. CORD annotations omit some visible text, so full-image errors also penalize text absent from the reference. |
+
+Quality uses the same executables, backend, weights, and provider loading/cache
+policies as timing, with declared task-specific prompts and output budgets.
+Python models use library-default loading dtype. Parameter storage/device
+inventories, loaded components, ambient autocast and TF32 settings are observed
+at model-load time; they do not trace internal forward autocast or prove
+kernel/accumulation dtype. OCR additionally proves a populated prefill cache
+and an incremental decode outside measurement.
+
+Native source-derived precision facts require an exact executable SHA-256
+binding, model/backend selection, full source commit, and pinned public source
+links. An optional `TERMITE_NATIVE_EVIDENCE` JSON file supplies
+`schema_version: 1`, an `executables` object keyed by binary SHA-256, and
+`source_commit` / `models[model][backend]` policies with a nonempty `sources`
+list. Policies can describe checkpoint, parameter, compute, accumulation,
+cache and component-specific dtype, plus route conditions. Without a matching
+binding the output explicitly says evidence is unavailable; a version string
+or output cosine never substitutes for it.
+
+Gemma compares native CLI rendered prompts/token IDs and llama.cpp
+template/tokenization diagnostics transiently. Retained JSON contains SHA-256
+fingerprints, counts, scope and comparison booleans, not full prompts or token
+arrays. Native IDs precede media expansion. The HTTP endpoint does not expose
+token IDs: matching counts are descriptive, not HTTP token identity or prompt
+parity.
 
 ## Requirements
 
@@ -117,7 +212,14 @@ Linux. Passing the backend explicitly makes operator intent clearer.
    to F16 GGML, hashed, and accompanied by a required provenance sidecar.
 4. The supplied Antfly binary pulls the six models.
 5. Revision-pinned model snapshots, a corpus built from recorded source
-   responses, and checksummed media fixtures are downloaded and verified.
+   responses, checksummed media, and the frozen public quality subsets are
+   downloaded and verified.
+
+The private materialized reference manifest records each verified snapshot's
+local path. Offline checks use that selected snapshot, rather than requesting
+unneeded repository files such as model-card images. Do not transfer those
+machine-local paths between hosts; materialize each host's manifest from its
+own verified snapshots.
 
 To prepare only Python and the two native reference binaries, run
 `make setup-tools`. `make convert-whisper` additionally prepares the pinned
@@ -126,12 +228,13 @@ targets accept `BACKEND`; neither obtains Antfly.
 
 ### Focused runs
 
-The Make interface accepts one workload, model, or cell selector and a
-lifecycle count:
+The Make interface accepts workload, model, and cell selectors, plus lifecycle
+counts and an independent speech/OCR repetition count:
 
 ```sh
 make run BACKEND=cuda ANTFLY_BIN="$ANTFLY_BIN" OUTPUT=results/whisper-short \
-  WORKLOAD=whisper MODEL=openai/whisper-small CELL=short LIFECYCLES=1
+  WORKLOAD=whisper MODEL=openai/whisper-small CELL=short \
+  LIFECYCLES=1 MEMORY_LIFECYCLES=1 REPETITIONS=2
 ```
 
 For repeated `--workload` or `--model` selectors, invoke the runner directly:
@@ -144,11 +247,15 @@ For repeated `--workload` or `--model` selectors, invoke the runner directly:
   --models-dir .data/models \
   --workload whisper \
   --workload ocr \
-  --lifecycles 3
+  --lifecycles 3 --memory-lifecycles 3 --repetitions 10
 ```
 
 `--only-cell` is intended for focused real smoke measurements, not a substitute
 for the complete paired suite.
+Use repeated `--phase speed`, `--phase memory`, or `--phase quality` to select
+phases. The default runs all three. A timing-cell selector does not reduce
+the separate frozen quality subset.
+
 
 ## Reproducible references
 
@@ -157,7 +264,7 @@ The direct reference pins are:
 - PyTorch `2.15.0`
 - Sentence Transformers `6.2.0`
 - GLiNER2 `[local]` `2.1.0`
-- Transformers `5.22.2`
+- Transformers `5.23.0`
 - llama.cpp `b10809` (`5266f24da75dc449bd56cbed7addb9c8e4a6a73e`)
 - whisper.cpp `v1.9.2` (`306c88f4d1286aec1bf96e544632897886af5501`)
 
@@ -173,7 +280,9 @@ locked `cuda-toolkit[cublas,nvcc]` extra resolves cuBLAS to
 `nvidia-cublas==13.4.1.3` and supplies the CUDA 13.2 `nvcc`, headers, and
 development files needed by the pinned native peers. The setup script discovers
 the toolkit root and either `lib` or `lib64` from the active environment rather
-than assuming a machine-specific installation path. `CUDA_ARCHITECTURES` is
+than assuming a machine-specific installation path. It supplies versioned CUDA
+library paths explicitly because NVIDIA's wheels omit unversioned linker
+symlinks. `CUDA_ARCHITECTURES` is
 passed to CMake as `CMAKE_CUDA_ARCHITECTURES` and defaults to `native`; it may be
 a CMake semicolon-separated architecture list.
 
@@ -242,7 +351,7 @@ these values:
 | `REFERENCE_PYTHON` | `TERMITE_REFERENCE_PYTHON` | `./.venv/bin/python` |
 | `REFERENCE_SNAPSHOTS` | `TERMITE_REFERENCES` | `./.data/reference_snapshots.json` |
 | `LLAMA_SERVER` | `TERMITE_LLAMA_SERVER` | `./.cache/bin/llama-server` |
-| `WHISPER_CPP` | `TERMITE_WHISPER_CPP` | `./.cache/bin/whisper-cli` |
+| `WHISPER_CPP` | `TERMITE_WHISPER_CPP` | `./.cache/bin/whisper-server` |
 | `WHISPER_CPP_MODEL` | `TERMITE_WHISPER_CPP_MODEL` | converted Whisper small |
 | `WHISPER_CPP_PROVENANCE` | `TERMITE_WHISPER_CPP_PROVENANCE` | conversion sidecar |
 
@@ -257,11 +366,14 @@ checkpoint defaults to caching disabled, which otherwise recomputes the decoder
 prefix for every output token. Earlier cache-disabled OCR timings are not
 comparable to this corrected reference and must be measured again.
 
-The runner's canonical result has a schema version, run id, status, timestamps,
-backend, neutral input/provenance records, and one step per
-workload/model/provider. Each step carries its actual metrics or a visible
-error. Paired quality and agreement records remain attached to the measured
-cells rather than being reduced to subprocess exit status.
+The runner's canonical schema v2 result has a run id, status, timestamps,
+backend, neutral input/provenance records, one step per model/provider/phase,
+and explicit per-cell states. `result.json`, `provenance.json`,
+`inputs.provenance.json`, and `terminal.json` are independently bounded below
+1 MiB. `receipt.json` records SHA-256 checksums for JSON evidence. Provider
+execution failures never erase completed sibling measurements. A fully
+recorded refusal can produce exit code zero with `partial` support; missing
+evidence and unexpected execution failures return nonzero.
 
 ## Fixtures, attribution, and licenses
 
@@ -288,8 +400,14 @@ redistributed by this repository.
   `media_manifest.json` records each Commons title and SHA-256. Every file
   retains the license and attribution requirements on its Commons description
   page; see [Commons reuse guidance](https://commons.wikimedia.org/wiki/Commons:Reusing_content_outside_Wikimedia).
-- OCR cells render deterministic synthetic pages with Pillow and contain no
-  externally sourced text or images.
+- OCR timing cells render deterministic synthetic pages with Pillow. Separate
+  quality inputs are original [CORD-v2](https://huggingface.co/datasets/naver-clova-ix/cord-v2)
+  test receipts at revision `7f0115a4b758a71d6473b8d085751692da2fef98`,
+  CC BY 4.0. Original image/annotation bytes are pinned; only reference reading
+  order and explicitly named diagnostic normalizations are derived.
+- BEIR/SciFact retrieval sources and judgments are CC BY-SA 4.0; GSM8K is MIT;
+  ARC-Challenge is CC BY-SA 4.0. The quality modules pin each source revision
+  and checksum and retain attribution/license pointers in provenance.
 
 The six Hugging Face model cards currently identify their weights as
 Apache-2.0. The Gemma 4 card also links Google's Gemma 4 license terms; review

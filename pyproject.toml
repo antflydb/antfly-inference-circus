@@ -15,7 +15,7 @@ dependencies = [
   "soundfile==0.14.0",
   "torch==2.15.0",
   "torchvision==0.29.2",
-  "transformers==5.22.2",
+  "transformers==5.23.0",
 ]
 
 [project.optional-dependencies]
