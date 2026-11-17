@@ -25,33 +25,44 @@ class WhisperBenchTests(unittest.TestCase):
         self.assertEqual(metric["wer"], 0.5)
         self.assertEqual(metric["exact_normalized_count"], 0)
 
-    def test_cells_cover_short_batch_and_real_multiwindow_audio(self) -> None:
+    def test_short_fixture_rejects_changed_bytes_and_invalid_format(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            media = root / "media"
-            media.mkdir()
-            entries = []
-            for index in range(8):
-                path = media / f"aud{index:02}.wav"
+            path = root / "short.wav"
+            manifest = root / "media_manifest.json"
+
+            def write_fixture(channels: int) -> None:
                 with wave.open(str(path), "wb") as output:
-                    output.setnchannels(1)
+                    output.setnchannels(channels)
                     output.setsampwidth(2)
                     output.setframerate(16000)
-                    output.writeframes(b"\0\0" * 16000 * 8)
-                entries.append({"name": path.name, "id": f"clip-{index}", "seconds": 8.0,
-                                "text": f"CLIP NUMBER {index}",
-                                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
-            manifest = root / "media_manifest.json"
-            manifest.write_text(json.dumps({"librispeech": {
-                "revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a"}, "audio": entries}))
-            with patch.object(whisper, "MEDIA_MANIFEST", manifest), patch.object(whisper.C, "MEDIA", media):
-                cells = whisper.make_cells(None, root / "out")
-            self.assertEqual([cell["id"] for cell in cells], whisper.CELLS)
-            self.assertEqual(len(cells[0]["calls"]), 1)
-            self.assertEqual(len(cells[1]["calls"]), 4)
-            self.assertEqual(len(cells[2]["calls"]), 1)
-            self.assertGreaterEqual(cells[2]["calls"][0]["seconds"], 60)
-            self.assertEqual(cells[2]["calls"][0]["ref"], " ".join(e["text"] for e in entries))
+                    output.writeframes(b"\0\0" * channels * 160)
+                manifest.write_text(json.dumps({"librispeech": {
+                    "revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a"},
+                    "audio": [{"name": path.name, "id": "clip", "seconds": 0.01,
+                               "text": "HELLO WORLD",
+                               "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}]}))
+
+            with patch.object(whisper, "MEDIA_MANIFEST", manifest), patch.object(whisper.C, "MEDIA", root):
+                write_fixture(1)
+                fixture = whisper.make_cells("short")[0]["calls"][0]
+                self.assertEqual(fixture["path"], path)
+                self.assertEqual(fixture["ref"], "HELLO WORLD")
+                path.write_bytes(path.read_bytes() + b"changed")
+                with self.assertRaisesRegex(ValueError, "checksum differs"):
+                    whisper.make_cells("short")
+                write_fixture(2)
+                with self.assertRaisesRegex(ValueError, "unexpected WAV format"):
+                    whisper.make_cells("short")
+
+    def test_removed_cells_are_rejected_by_reference_child(self) -> None:
+        for cell in ("batch4", "multiwindow60"):
+            argv = ["pyarm", "--backend", "auto", "--out", "/unused", "--lc", "0",
+                    "--only-cell", cell]
+            with self.subTest(cell=cell):
+                with patch("sys.stderr"), self.assertRaises(SystemExit) as raised:
+                    whisper.main(argv)
+                self.assertEqual(raised.exception.code, 2)
 
     def test_cpp_native_timing_requires_valid_load_and_total_fields(self) -> None:
         parsed = whisper._parse_cpp_timings(

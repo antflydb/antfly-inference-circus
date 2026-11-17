@@ -44,7 +44,6 @@ CELLS = {
         "mixed_paragraph_x1",
         "ent_paragraph_b8",
         "ent_paragraph_b32",
-        "long_book_w384",
     ],
     "decide": ["decide_x1", "decide_b8", "decide_b32"],
 }
@@ -81,14 +80,13 @@ def make_cells(model: str, only: str | None = None) -> list[dict]:
     corpus = C.load_corpus()
     cells: list[dict] = []
 
-    def add(cell_id, calls, schema, warmup=3, long=None, python_batch_size=None):
+    def add(cell_id, calls, schema, warmup=3, python_batch_size=None):
         cells.append(
             {
                 "id": cell_id,
                 "calls": calls,
                 "schema": schema,
                 "warmup": warmup,
-                "long": long,
                 "python_batch_size": python_batch_size,
             }
         )
@@ -102,14 +100,6 @@ def make_cells(model: str, only: str | None = None) -> list[dict]:
         add("mixed_paragraph_x1", [[text] for text in paragraphs[64:96]], MIXED_SCHEMA)
         add("ent_paragraph_b8", chunked(paragraphs[:64], 8), {"entities": ENTITY_LABELS}, warmup=1, python_batch_size=8)
         add("ent_paragraph_b32", chunked(paragraphs[:128], 32), {"entities": ENTITY_LABELS}, warmup=1, python_batch_size=32)
-        add(
-            "long_book_w384",
-            [[chapter["text"]] for chapter in corpus["chapters"]],
-            {"entities": ENTITY_LABELS},
-            warmup=1,
-            long={"window_words": 384, "overlap_words": 64},
-            python_batch_size=8,
-        )
     elif model == "decide":
         texts = hotel_texts(256)
         add("decide_x1", [[text] for text in texts[:64]], DECIDE_SCHEMA)
@@ -223,8 +213,6 @@ def word_count(texts: list[str]) -> int:
 
 def request_body(model_id: str, texts: list[str], cell: dict) -> dict:
     options = {"include_spans": True, "include_confidence": True}
-    if cell["long"] is not None:
-        options["long_document"] = {"mode": "window", "max_windows": 128, **cell["long"]}
     return {
         "schema_version": 2,
         "model": model_id,
@@ -296,7 +284,6 @@ def run_antfly(args, cells: list[dict], out: Path, lifecycle: int) -> dict:
                                 "k": index,
                                 "j": output_index,
                                 "o": normalize_antfly(item, texts[output_index]),
-                                "windows": (item.get("long_document") or {}).get("window_count"),
                             }
                         )
     finally:
@@ -339,16 +326,6 @@ def run_python(args, cells: list[dict], out: Path, lifecycle: int) -> dict:
 
     def call(texts, cell, schema):
         with torch.inference_mode():
-            if cell["long"] is not None:
-                return model.batch_extract_long(
-                    texts,
-                    schema,
-                    batch_size=cell["python_batch_size"] or 8,
-                    include_spans=True,
-                    include_confidence=True,
-                    chunk_size=cell["long"]["window_words"],
-                    chunk_overlap=cell["long"]["overlap_words"],
-                )
             if len(texts) == 1:
                 return [model.extract(texts[0], schema, include_spans=True, include_confidence=True)]
             return model.batch_extract(
@@ -492,9 +469,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    C.configure_backend(args.backend)
     if args.only_cell and args.only_cell not in CELLS[args.model]:
-        parser().error(f"--only-cell must be one of {CELLS[args.model]}")
+        parser().error(f"unknown --only-cell {args.only_cell!r}; must be one of {CELLS[args.model]}")
+    C.configure_backend(args.backend)
     if args.command == "run":
         return 0 if orchestrate(args) else 1
     print(
