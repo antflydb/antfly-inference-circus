@@ -339,6 +339,17 @@ class ReaderContractTests(unittest.TestCase):
 class ProcessExitObservationTests(unittest.TestCase):
     def setUp(self):
         import psutil
+        self.clock = 0.0
+
+        def sleep(seconds):
+            self.clock += seconds
+
+        monotonic = patch.object(C.time, "monotonic", side_effect=lambda: self.clock)
+        sleeping = patch.object(C.time, "sleep", side_effect=sleep)
+        monotonic.start()
+        sleeping.start()
+        self.addCleanup(monotonic.stop)
+        self.addCleanup(sleeping.stop)
         self.sampler = C.Sampler.__new__(C.Sampler)
         self.process = Mock()
         self.process.create_time.return_value = 123.0
@@ -363,6 +374,69 @@ class ProcessExitObservationTests(unittest.TestCase):
         self.assertFalse(value["coverage_valid"])
         self.assertFalse(missing)
         self.assertIsNone(discarded)
+        self.assertAlmostEqual(self.clock, self.sampler._DARWIN_EXIT_CONFIRM_SECONDS)
+        self.assertEqual(value["exit_confirmation"]["create_time"], 123.0)
+        self.assertEqual(value["exit_confirmation"]["final_state"], "live")
+        self.assertIsNone(value["corrected_fp_upper_bytes"])
+
+    def test_vm_disappears_before_process_becomes_zombie(self):
+        self.process.status.side_effect = lambda: (
+            self.sampler.psutil.STATUS_ZOMBIE if self.clock >= 0.03 else "running")
+        value, missing, discarded = self.sampler._darwin_observation(123)
+        self.assertIsNone(value)
+        self.assertFalse(missing)
+        self.assertEqual(discarded["create_time"], 123.0)
+        self.assertEqual(discarded["evidence"], "original_process_is_zombie")
+        self.assertEqual(discarded["exit_confirmation"]["initial_state"], "live")
+        self.assertEqual(discarded["incomplete_observation"], self.value)
+        self.assertFalse(discarded["incomplete_observation"]["coverage_valid"])
+        self.assertIsNone(discarded["incomplete_observation"]["corrected_fp_upper_bytes"])
+
+    def test_original_identity_disappears_during_bounded_confirmation(self):
+        import psutil
+        for vanished in ("reused", "absent"):
+            with self.subTest(vanished=vanished):
+                self.clock = 0.0
+
+                def running():
+                    if self.clock < 0.02:
+                        return True
+                    if vanished == "absent":
+                        raise psutil.NoSuchProcess(123)
+                    return False
+
+                self.process.is_running.side_effect = running
+                value, missing, discarded = self.sampler._darwin_observation(123)
+                self.assertIsNone(value)
+                self.assertFalse(missing)
+                self.assertEqual(discarded["create_time"], 123.0)
+                self.assertEqual(discarded["exit_confirmation"]["initial_state"], "live")
+                self.assertEqual(discarded["evidence"], (
+                    "original_process_no_longer_exists" if vanished == "absent"
+                    else "original_process_exited_or_pid_reused"))
+
+    def test_exit_after_confirmation_deadline_cannot_reclassify_live_failure(self):
+        self.process.is_running.side_effect = lambda: (
+            self.clock <= self.sampler._DARWIN_EXIT_CONFIRM_SECONDS)
+        value, missing, discarded = self.sampler._darwin_observation(123)
+        self.assertIs(value, self.value)
+        self.assertFalse(missing)
+        self.assertFalse(value["coverage_valid"])
+        self.assertIsNone(discarded)
+        self.assertEqual(value["exit_confirmation"]["final_state"], "live")
+        self.clock += 0.01
+        self.assertFalse(self.process.is_running())
+        self.assertFalse(value["coverage_valid"])
+
+    def test_unconfirmed_original_identity_cannot_discard_even_after_exit(self):
+        import psutil
+        self.process.create_time.side_effect = psutil.AccessDenied(123)
+        self.process.is_running.return_value = False
+        value, missing, discarded = self.sampler._darwin_observation(123)
+        self.assertIs(value, self.value)
+        self.assertFalse(missing)
+        self.assertFalse(value["coverage_valid"])
+        self.assertIsNone(discarded)
 
     def test_confirmed_exit_or_reuse_retains_interrupted_observation_not_a_peak(self):
         self.process.is_running.return_value = False
@@ -372,6 +446,54 @@ class ProcessExitObservationTests(unittest.TestCase):
         self.assertEqual(discarded["create_time"], 123.0)
         self.assertEqual(discarded["evidence"], "original_process_exited_or_pid_reused")
         self.assertEqual(discarded["incomplete_observation"], self.value)
+
+    def test_delayed_exit_retains_invalid_timeline_without_polluting_peaks(self):
+        import io
+        import json
+        import threading
+
+        complete = {"coverage_valid": True, "fp": 2 * P, "rss": 3 * P,
+                    "mapped_storage_resident_lower_bytes": 8 * P,
+                    "mapped_storage_resident_upper_bytes": 8 * P}
+        self.value.update(fp=100 * P, rss=110 * P)
+        self.sampler.reader.read.side_effect = [complete, self.value]
+        self.process.is_running.side_effect = [True, False]
+        self.sampler._pids = lambda: [123]
+        self.sampler.interval = 0.2
+        self.sampler.processes_seen = set()
+        self.sampler.timeline = io.StringIO()
+        self.sampler.stop_event = threading.Event()
+        self.sampler.peak = {
+            "samples": 0, "invalid_samples": 0, "coverage_errors": [],
+            "discarded_exit_observations": 0, "observer_seconds": 0,
+            "max_sample_gap_seconds": 0, "raw_process_tree_footprint_peak_bytes": 0,
+            "peak_rss_bytes": 0, "memory_peak_lower_bytes": 0,
+            "memory_peak_upper_bytes": 0,
+        }
+
+        def next_iteration(seconds):
+            if self.sampler.peak["discarded_exit_observations"]:
+                self.sampler.stop_event.set()
+
+        with patch.object(C, "DARWIN", True), \
+             patch.object(self.sampler.stop_event, "wait", side_effect=next_iteration):
+            self.sampler._sample_loop()
+        rows = [json.loads(line) for line in self.sampler.timeline.getvalue().splitlines()]
+        self.assertEqual(self.sampler.peak["samples"], 1)
+        self.assertEqual(self.sampler.peak["invalid_samples"], 0)
+        self.assertEqual(self.sampler.peak["coverage_errors"], [])
+        self.assertEqual(self.sampler.peak["raw_process_tree_footprint_peak_bytes"], 2 * P)
+        self.assertEqual(self.sampler.peak["memory_peak_lower_bytes"], 8 * P)
+        self.assertEqual(self.sampler.peak["memory_peak_upper_bytes"], 10 * P)
+        self.assertEqual(rows[1]["observation_status"], "no_complete_process_observation")
+        discarded = rows[1]["discarded_exit_observations"][0]
+        self.assertEqual(discarded["create_time"], 123.0)
+        self.assertEqual(discarded["exit_confirmation"]["initial_state"], "live")
+        self.assertEqual(discarded["evidence"], "original_process_exited_or_pid_reused")
+        self.assertFalse(discarded["incomplete_observation"]["coverage_valid"])
+        self.assertIsNone(discarded["incomplete_observation"]["corrected_fp_upper_bytes"])
+        self.assertEqual(discarded["incomplete_observation"]["errors"],
+                         ["region read size=0 errno=3"])
 
     def test_zombie_is_positive_exit_evidence(self):
         self.process.status.return_value = self.sampler.psutil.STATUS_ZOMBIE
@@ -387,6 +509,7 @@ class ProcessExitObservationTests(unittest.TestCase):
         self.assertIs(value, self.value)
         self.assertFalse(value["coverage_valid"])
         self.assertIsNone(discarded)
+        self.assertEqual(self.clock, 0.0)
 
     def test_dead_process_does_not_hide_a_timeout_or_unverified_submap(self):
         self.process.is_running.return_value = False
@@ -409,6 +532,14 @@ class ProcessExitObservationTests(unittest.TestCase):
         value, missing, discarded = self.sampler._darwin_observation(123)
         self.assertFalse(missing)
         self.assertEqual(discarded["errors"], ["region read size=0 errno=3"])
+        self.process.is_running.side_effect = lambda: self.clock < 0.23
+        value, missing, discarded = self.sampler._darwin_observation(123)
+        self.assertIsNone(value)
+        self.assertFalse(missing)
+        self.assertEqual(discarded["create_time"], 123.0)
+        self.assertEqual(discarded["exit_confirmation"]["initial_state"], "live")
+        self.assertEqual(discarded["errors"], ["region read size=0 errno=3"])
+        self.process.is_running.side_effect = None
         self.sampler.reader.last_target_unavailable = False
         self.sampler.reader.last_error = "rusage permission denied"
         value, missing, discarded = self.sampler._darwin_observation(123)

@@ -192,7 +192,7 @@ def run(args) -> dict:
             provider["lifecycle"].update(server.start())
             provider["lifecycle"]["precision"] = (C.native_precision(args.antfly, G.MODEL, models_dir=G.GEN_MODELS_DIR)
                 if arm == "antfly" else {"implementation": "llama.cpp", "binary": C.file_identity(Path(shutil.which(args.llama_server) or args.llama_server)),
-                                        "version": G.llama_version(args.llama_server), "requested_kv": {"key": "f16", "value": "f16"},
+                                        "version": provider["lifecycle"]["version"], "requested_kv": {"key": "f16", "value": "f16"},
                                         "compute_dtype": "not directly observed; GGUF storage is not arithmetic precision"})
             for index, task in enumerate(tasks):
                 payload = G.request_body({"text": prompt(task)}, {"max_tokens": MAX_TOKENS}, arm)

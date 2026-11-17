@@ -387,6 +387,8 @@ def memory_sampling_enabled() -> bool:
 class Sampler:
     """Non-suspending concurrent process-tree observations; independent peaks never sum."""
 
+    _DARWIN_EXIT_CONFIRM_SECONDS = 0.2
+
     def __init__(self, pid: int, out_dir: Path, tag: str, interval: float = 0.2):
         import threading
         import psutil
@@ -420,6 +422,7 @@ class Sampler:
                 "coverage_evidence": self.reader.mapping_scope_evidence,
                 "region_walk_budget_seconds": self.reader.max_seconds,
                 "region_walk_budget_count": self.reader.max_regions,
+                "exit_confirmation_budget_seconds": self._DARWIN_EXIT_CONFIRM_SECONDS,
                 "discarded_exit_observations": 0,
             })
         if not DARWIN:
@@ -456,7 +459,7 @@ class Sampler:
         process = None
         try:
             process = self.psutil.Process(pid)
-            process.create_time()  # Cache identity before the observation.
+            create_time = process.create_time()  # Cache identity before the observation.
         except self.psutil.NoSuchProcess:
             return None, False, {"pid": pid, "evidence": "absent_before_read"}
         except self.psutil.Error:
@@ -465,23 +468,45 @@ class Sampler:
         unavailable = (self.reader.last_target_unavailable if value is None
                        else value.get("target_unavailable", False))
         if unavailable and process is not None:
+            # XNU can make the task's VM map unavailable before libproc exposes
+            # a zombie/absent process. Resolve only that typed race, without
+            # rereading memory, signalling the process, or reaping Popen's child.
+            started = time.monotonic()
+            deadline = started + self._DARWIN_EXIT_CONFIRM_SECONDS
+            confirmation = {"budget_seconds": self._DARWIN_EXIT_CONFIRM_SECONDS,
+                            "checks": 0, "initial_state": None}
             evidence = None
-            try:
-                if not process.is_running():
-                    evidence = "original_process_exited_or_pid_reused"
-                elif process.status() == self.psutil.STATUS_ZOMBIE:
-                    evidence = "original_process_is_zombie"
-            except self.psutil.NoSuchProcess:
-                evidence = "original_process_no_longer_exists"
-            except self.psutil.Error:
-                pass
+            while True:
+                confirmation["checks"] += 1
+                state = "live"
+                try:
+                    if not process.is_running():
+                        evidence = "original_process_exited_or_pid_reused"
+                    elif process.status() == self.psutil.STATUS_ZOMBIE:
+                        evidence = "original_process_is_zombie"
+                except self.psutil.NoSuchProcess:
+                    evidence = "original_process_no_longer_exists"
+                except self.psutil.Error as error:
+                    state = "unconfirmed"
+                    confirmation["error"] = public_error(error)
+                state = evidence or state
+                if confirmation["initial_state"] is None:
+                    confirmation["initial_state"] = state
+                confirmation["final_state"] = state
+                remaining = deadline - time.monotonic()
+                if evidence or state == "unconfirmed" or remaining <= 0:
+                    break
+                time.sleep(min(0.01, remaining))
+            confirmation["elapsed_seconds"] = time.monotonic() - started
             if evidence:
                 return None, False, {
-                    "pid": pid, "create_time": process.create_time(),
-                    "evidence": evidence,
+                    "pid": pid, "create_time": create_time,
+                    "evidence": evidence, "exit_confirmation": confirmation,
                     "errors": [self.reader.last_error] if value is None else value["errors"],
                     "incomplete_observation": value,
                 }
+            if value is not None:
+                value["exit_confirmation"] = {"create_time": create_time, **confirmation}
         return value, value is None, None
 
     def _sample_loop(self) -> None:
@@ -568,7 +593,8 @@ class Sampler:
         self.stop_event.set()
         timeout = 5
         if DARWIN:
-            timeout += self.sample_process_count * self.reader.max_seconds
+            timeout += self.sample_process_count * (
+                self.reader.max_seconds + self._DARWIN_EXIT_CONFIRM_SECONDS)
         self.thread.join(timeout=timeout)
         if self.thread.is_alive():
             raise RuntimeError("memory sampler failed to stop")

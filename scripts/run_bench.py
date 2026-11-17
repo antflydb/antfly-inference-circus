@@ -32,7 +32,7 @@ PULLS = {
     "gliner-base": ("fastino/gliner2.5-base-v1:safetensors", []),
     "gliner-decide": ("fastino/GLiNER2.5-Decide:safetensors", []),
     "gemma4": ("google/gemma-4-E4B-it-qat-q4_0-gguf:gguf", []),
-    "whisper": ("openai/whisper-small:safetensors", []),
+    "whisper": ("openai/whisper-small:safetensors", ["--tasks", "transcribe"]),
     "ocr": ("lightonai/LightOnOCR-3-0.8B:safetensors", []),
 }
 REFERENCE_MODULES = {
@@ -315,7 +315,7 @@ def preflight(keys: list[str], binary: Path, backend: str, phases: set[str] | No
         llama_path = Path(llama_resolved)
         assets["llama_server"] = {
             **C.file_identity(llama_path),
-            "version": command_version(llama_path),
+            "version_source": "running server GET /props.build_info (lifecycle metadata)",
         }
     if "whisper" in keys:
         whisper = import_script("whisper_bench.py")

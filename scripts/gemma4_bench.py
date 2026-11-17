@@ -444,10 +444,12 @@ class LlamaServer:
             if C.memory_sampling_enabled():
                 self.sampler = C.Sampler(self.process.pid, self.out, self.tag)
             ready = C.wait_http(self.process, self.port, "/health", 300, self.log.name, started)
+            version = llama_version(self.port)
         except Exception:
             self.stop()
             raise
-        return {"ready_s": ready, "command": C.public_command(self.argv)}
+        return {"ready_s": ready, "command": C.public_command(self.argv),
+                "version": version, "version_source": "GET /props.build_info"}
 
     def stop(self) -> dict:
         try:
@@ -459,9 +461,23 @@ class LlamaServer:
                 self.log.close()
 
 
-def llama_version(binary: str) -> str:
-    process = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30, check=False)
-    return " ".join((process.stdout + process.stderr).split())[:300]
+def llama_version(port: int) -> str:
+    """Read the running peer's build identity without a second GPU startup."""
+    # This pin initializes Metal and compiles embedded kernels before parsing
+    # --version. Use the same persistent server that serves the measured calls.
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        connection.request("GET", "/props")
+        response = connection.getresponse()
+        properties = json.loads(response.read())
+        if response.status != 200:
+            raise C.HttpResponseError(response.status, properties)
+        version = properties.get("build_info")
+        if not isinstance(version, str) or not version.strip():
+            raise RuntimeError("llama.cpp GET /props did not report build_info")
+        return version
+    finally:
+        connection.close()
 
 
 def warmup_observation(response: dict) -> dict:
@@ -491,7 +507,7 @@ def run_arm(args, arm: str, files: dict, cells: list[dict], out: Path, lifecycle
     else:
         server = LlamaServer(args.llama_server, files, out, tag)
         endpoint = "/v1/chat/completions"
-        info = {"arm": arm, "provider": "llama.cpp", "binary": Path(args.llama_server).name, "version": llama_version(args.llama_server)}
+        info = {"arm": arm, "provider": "llama.cpp", "binary": Path(args.llama_server).name}
         info["precision"] = {"implementation": "llama.cpp", "binary": C.file_identity(Path(shutil.which(args.llama_server) or args.llama_server)),
                              "policy": "GGUF mixed tensor storage; no single floating-point parameter dtype",
                              "requested_kv": {"key": "f16", "value": "f16"},

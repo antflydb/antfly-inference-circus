@@ -84,7 +84,7 @@ class GemmaProducerTests(unittest.TestCase):
                 self.tag = args[-1]
 
             def start(self):
-                return {"ready_s": 0.001}
+                return {"ready_s": 0.001, **({"version": "test reference"} if "llama" in self.tag else {})}
 
             def stop(self):
                 if owner.fail_native_stop and "antfly" in self.tag:
@@ -96,7 +96,6 @@ class GemmaProducerTests(unittest.TestCase):
             ("gemma4_bench.LlamaServer", Server),
             ("gemma4_bench.C.native_precision", lambda *a, **k: {}),
             ("gemma4_bench.C.host_snapshot", lambda: {}),
-            ("gemma4_bench.llama_version", lambda binary: "test reference"),
             ("gemma4_bench.loading_evidence", lambda *a: {"tensor_inventory": {}, "mmap": {"observed_log_lines": []}}),
             ("gemma4_bench.C.exclusive_bench_lock", lambda: 0),
             ("gemma4_bench.C.wait_quiet", lambda *a, **k: {}),

@@ -62,6 +62,11 @@ Memory observations target a 200 ms interval without suspending the rooted
 process tree, only in isolated memory lifecycles. Darwin walks have a finite
 two-second allowance per process; actual observation cost and gaps are retained,
 so this is not a guaranteed 200 ms cadence or an unsampled lifetime maximum.
+Typed target-unavailable reads allow an additional bounded 200 ms to confirm
+the original process has exited, become a zombie, or been replaced. This does
+not reread memory or alter the target. Incomplete observations and confirmation
+diagnostics remain retained; live or unconfirmed failures still invalidate
+coverage rather than contribute a partial peak.
 Speed and task-quality runs do not start the observer. Direct per-workload
 instruments enable it only with `TERMITE_SAMPLE_MEMORY=1`; the top-level runner
 sets this by phase.
@@ -215,6 +220,24 @@ Linux. Passing the backend explicitly makes operator intent clearer.
    responses, checksummed media, and the frozen public quality subsets are
    downloaded and verified.
 
+Whisper's native pull uses the documented `--tasks transcribe` registration
+([official guide](https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/docs/guides/transcription.mdx#L129-L135)).
+With Antfly v0.3.1, omitting this flag can publish Whisper as an image-only
+reader, causing an otherwise valid `/ai/v1/dictate` request to return
+`UNSUPPORTED_MODALITY` before model execution. Existing installations prepared
+without the flag need an explicit re-pull into the same model directory:
+
+```sh
+"$ANTFLY_BIN" inference pull openai/whisper-small:safetensors \
+  --models-dir "${TERMITE_MODELS_DIR:-${TERMITE_DATA:-.data}/models}" \
+  --tasks transcribe
+```
+
+This uses the official pull path to regenerate registration metadata; do not
+edit the manifest manually. Preserve the original refusal records, verify the
+re-pulled source revision and weight checksums against the pinned reference,
+and use a fresh output directory for subsequent runs.
+
 The private materialized reference manifest records each verified snapshot's
 local path. Offline checks use that selected snapshot, rather than requesting
 unneeded repository files such as model-card images. Do not transfer those
@@ -265,8 +288,14 @@ The direct reference pins are:
 - Sentence Transformers `6.2.0`
 - GLiNER2 `[local]` `2.1.0`
 - Transformers `5.23.0`
-- llama.cpp `b10809` (`5266f24da75dc449bd56cbed7addb9c8e4a6a73e`)
+- llama.cpp upstream source tag `b10809` (`5266f24da75dc449bd56cbed7addb9c8e4a6a73e`)
 - whisper.cpp `v1.9.2` (`306c88f4d1286aec1bf96e544632897886af5501`)
+
+llama.cpp's generated build number can differ in a shallow checkout. The harness
+records the actual ready server's `GET /props.build_info` alongside executable
+identity; it does not relabel that response as the upstream tag. A separate
+`--version` process is not a metadata-only operation on this Metal build: static
+backend initialization compiles shaders before argument handling.
 
 `uv.lock` fixes the complete Python graph, including Pillow, PyArrow,
 SoundFile, process sampling, and the platform wheels. The CUDA extra adds the
