@@ -251,6 +251,12 @@ token limits; override it with `TERMITE_SCRATCH_BUDGET_MB`. This is a workload
 budget, not a host-memory measurement or an instruction to allocate that amount.
 Actual process memory is sampled separately.
 
+The LightOnOCR Transformers reference explicitly enables decoding-state caching
+(`use_cache=True`) and records that policy in its lifecycle metadata. The pinned
+checkpoint defaults to caching disabled, which otherwise recomputes the decoder
+prefix for every output token. Earlier cache-disabled OCR timings are not
+comparable to this corrected reference and must be measured again.
+
 The runner's canonical result has a schema version, run id, status, timestamps,
 backend, neutral input/provenance records, and one step per
 workload/model/provider. Each step carries its actual metrics or a visible

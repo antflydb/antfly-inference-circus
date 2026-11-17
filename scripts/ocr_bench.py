@@ -296,7 +296,8 @@ def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
                 return_dict=True, return_tensors="pt", padding=len(conversations) > 1,
                 enable_thinking=False).to(device)
             with torch.inference_mode():
-                generated = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False, num_beams=1)
+                generated = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False,
+                                           num_beams=1, use_cache=True)
             prompt_width = inputs["input_ids"].shape[1]
             return processor.batch_decode(generated[:, prompt_width:], skip_special_tokens=True,
                                           clean_up_tokenization_spaces=False)
@@ -325,7 +326,7 @@ def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
             "parameter_dtype": str(next(model.parameters()).dtype), "device": device,
             "api": "AutoProcessor.apply_chat_template + Qwen3_5ForConditionalGeneration.generate",
             "decoding": {"prompt": "", "enable_thinking": False, "max_new_tokens": MAX_TOKENS,
-                         "do_sample": False, "num_beams": 1, "padding_side": "left"},
+                         "do_sample": False, "num_beams": 1, "padding_side": "left", "use_cache": True},
             "device_memory": C.torch_device_bytes(torch), "rows": rows}
 
 
