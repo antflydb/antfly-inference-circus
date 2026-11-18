@@ -76,7 +76,7 @@ def fetch(models_dir: Path, output: Path, repos: set[str]) -> list[dict]:
             verified.append({"name": artifact["path"], "sha256": actual, "size_bytes": remote_file.stat().st_size})
         if not all(any(item["name"] == weight["path"] for item in verified) for weight in weight_artifacts):
             raise RuntimeError(f"{repo}@{revision} weight verification is incomplete")
-        row = {"repo": repo, "revision": revision, "files": verified, "match": True}
+        row = {"repo": repo, "revision": revision, "path": str(snapshot.resolve()), "files": verified, "match": True}
         rows.append(row)
         print(json.dumps(row, separators=(",", ":")), flush=True)
     missing = repos - {row["repo"] for row in rows}

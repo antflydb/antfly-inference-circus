@@ -2,7 +2,8 @@
 """Paired Whisper-small benchmark: Antfly, Transformers, and whisper.cpp.
 
 All arms use openai/whisper-small, forced English transcription, greedy decoding,
-and text-only output. The workload is one short LibriSpeech clip per invocation.
+and text-only output. Each invocation transcribes one intact LibriSpeech recording:
+short (~6s), medium (~15s), or near-window long (~29s), with no multiwindow/fanout.
 """
 from __future__ import annotations
 
@@ -29,9 +30,10 @@ MODEL = "openai/whisper-small"
 MODELS = [MODEL]
 WORKLOAD = "whisper"
 PROVIDERS = ["antfly", "transformers", "whisper.cpp"]
-CELLS = ["short"]
+CELLS = ["short", "medium", "long"]
 REVISION = "973afd24965f72e36ca33b3055d56a652f456b4d"
 SOURCE_WEIGHT_SHA256 = "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b"
+CPP_REVISION = "306c88f4d1286aec1bf96e544632897886af5501"  # whisper.cpp v1.9.2
 MEDIA_MANIFEST = C.ROOT / "media_manifest.json"
 
 
@@ -68,22 +70,30 @@ def edit_distance(left: list[str] | str, right: list[str] | str) -> int:
 
 
 def quality(texts: list[str], references: list[str]) -> dict[str, Any]:
-    if len(texts) != len(references):
-        raise ValueError("transcript/reference count differs")
+    if len(texts) != len(references) or not references:
+        raise ValueError("need equal, nonempty transcript/reference sets")
     rows = []
-    total_edits = total_words = 0
     for text, reference in zip(texts, references, strict=True):
-        observed = normalize_text(text).split()
-        expected = normalize_text(reference).split()
-        edits = edit_distance(observed, expected)
-        total_edits += edits
-        total_words += len(expected)
-        rows.append({"word_edits": edits, "reference_words": len(expected),
-                     "wer": edits / max(1, len(expected)),
+        observed, expected = normalize_text(text), normalize_text(reference)
+        words = expected.split()
+        if not words:
+            raise ValueError("reference has no normalized words")
+        # CER excludes spaces; punctuation/case normalization is shared with WER.
+        chars = expected.replace(" ", "")
+        word_edits = edit_distance(observed.split(), words)
+        character_edits = edit_distance(observed.replace(" ", ""), chars)
+        rows.append({"word_edits": word_edits, "reference_words": len(words),
+                     "character_edits": character_edits, "reference_characters": len(chars),
+                     "wer": word_edits / len(words), "cer": character_edits / len(chars),
                      "exact_normalized": observed == expected})
-    wer = total_edits / max(1, total_words)
-    return {"wer": wer, "word_accuracy": max(0.0, 1.0 - wer),
-            "word_edits": total_edits, "reference_words": total_words,
+    word_edits = sum(row["word_edits"] for row in rows)
+    words = sum(row["reference_words"] for row in rows)
+    character_edits = sum(row["character_edits"] for row in rows)
+    characters = sum(row["reference_characters"] for row in rows)
+    return {"wer": word_edits / words, "cer": character_edits / characters,
+            "word_edits": word_edits, "reference_words": words,
+            "character_edits": character_edits, "reference_characters": characters,
+            "clips": len(rows),
             "exact_normalized_count": sum(row["exact_normalized"] for row in rows),
             "items": rows}
 
@@ -104,17 +114,26 @@ def _verified_manifest() -> dict[str, Any]:
         if (source.getnchannels(), source.getsampwidth(), source.getframerate(),
                 source.getcomptype()) != (1, 2, 16000, "NONE"):
             raise ValueError(f"unexpected WAV format: {entry['name']}")
+        # Timing denominators use actual sample count, not the manifest's
+        # two-decimal display duration.
+        entry["seconds"] = source.getnframes() / source.getframerate()
     return manifest
 
 
 def make_cells(only: str | None) -> list[dict[str, Any]]:
-    if only not in (None, "short"):
+    if only not in (None, *CELLS):
         raise ValueError(f"unknown cell: {only}")
-    entry = _verified_manifest()["audio"][0]
-    return [{"id": "short", "calls": [
-        {"id": entry["id"], "path": C.MEDIA / entry["name"],
-         "ref": entry["text"], "seconds": float(entry["seconds"]),
-         "sha256": entry["sha256"]}]}]
+    result = []
+    if only in (None, "short"):
+        entry = _verified_manifest()["audio"][0]
+        result.append({"id": "short", "calls": [
+            {"id": entry["id"], "path": C.MEDIA / entry["name"],
+             "ref": entry["text"], "seconds": float(entry["seconds"]),
+             "sha256": entry["sha256"]}]})
+    if only != "short":
+        from quality_whisper import timing_clips
+        result.extend(timing_clips(only))
+    return result
 
 
 def _antfly_request(call: dict[str, Any]) -> bytes:
@@ -134,25 +153,99 @@ def _antfly_one(port: int, data: bytes) -> tuple[str, float]:
         elapsed_ms = (time.perf_counter() - started) * 1000
     finally:
         connection.close()
+    if response.status != 200:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        raise C.HttpResponseError(response.status, payload)
     payload = json.loads(raw) if raw else {}
-    if response.status != 200 or not isinstance(payload.get("text"), str):
-        raise RuntimeError(f"Antfly dictate failed status={response.status} error={payload.get('error')!r}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+        raise RuntimeError("Antfly dictate returned a malformed successful response")
     return payload["text"], elapsed_ms
 
 
 def _cell_row(arm: str, cell: dict[str, Any], texts: list[str], elapsed_ms: float,
               lc: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not math.isfinite(elapsed_ms) or elapsed_ms <= 0:
+        raise ValueError("elapsed request time must be finite and positive")
     references = [call["ref"] for call in cell["calls"]]
     audio_seconds = sum(float(call["seconds"]) for call in cell["calls"])
+    if not math.isfinite(audio_seconds) or audio_seconds <= 0:
+        raise ValueError("audio duration must be finite and positive")
     row: dict[str, Any] = {"workload": WORKLOAD, "model": MODEL, "provider": arm, "arm": arm,
         "lc": lc, "cell": cell["id"], "n_inputs": len(texts), "audio_seconds": audio_seconds,
         "words": sum(len(normalize_text(reference).split()) for reference in references),
         "ms": round(elapsed_ms, 3), "cell_wall_s": elapsed_ms / 1000,
-        "audio_x_realtime": audio_seconds / max(elapsed_ms / 1000, 1e-9),
+        "request_ms": [round(elapsed_ms, 3)], "requests_per_second": 1000 / elapsed_ms,
+        "audio_x_realtime": audio_seconds * 1000 / elapsed_ms,
+        "audio_real_time_factor": elapsed_ms / (1000 * audio_seconds),
         "quality": quality(texts, references), "ok": True}
     if extra:
         row.update(extra)
     return row
+
+
+def _record_error(info: dict[str, Any], exc: Exception, stage: str, **identity: Any) -> dict[str, Any]:
+    fields = exc.call_fields() if isinstance(exc, C.HttpResponseError) else {
+        "ok": False, "error": public_error(exc)}
+    refused = C.call_refused(fields)
+    detail = {**identity, **fields, "stage": stage, "state": "refused" if refused else "failed"}
+    info.setdefault("errors", []).append(detail)
+    if not refused:
+        info.setdefault("error", fields["error"])
+    return detail
+
+
+def _measure_cells(info: dict[str, Any], cells: list[dict[str, Any]], lc: int,
+                   repetitions: int, prepare, extra) -> None:
+    """Retain each actual attempt; a failed cell never replaces earlier evidence."""
+    warmups = info["warmup"]["cells"]
+    for cell in cells:
+        try:
+            infer = prepare(cell)
+        except Exception as exc:
+            _record_error(info, exc, "prepare", cell=cell["id"])
+            continue
+        warm_state = "complete"
+        try:
+            texts, elapsed_ms, _ = infer()
+            warmups.append({"cell": cell["id"], "state": "complete",
+                            "ms": round(elapsed_ms, 3),
+                            "nonempty": bool(normalize_text(texts[0])), "measured": False})
+            info["warmup"]["performed"] = True
+            info["warmup"]["inference_count"] += 1
+        except Exception as exc:
+            detail = _record_error(info, exc, "warmup", cell=cell["id"])
+            warmups.append({**detail, "measured": False})
+            warm_state = detail["state"]
+            if warm_state != "refused":
+                continue
+        for repetition in range(repetitions):
+            try:
+                texts, elapsed_ms, details = infer()
+                call = _cell_row(info["arm"], cell, texts, elapsed_ms, lc, {
+                    **extra(cell), **details, "repetition": repetition,
+                    "warmup_state": warm_state})
+                row = {"call": call, "texts": texts, "refs": [item["ref"] for item in cell["calls"]]}
+            except Exception as exc:
+                detail = _record_error(info, exc, "measured", cell=cell["id"], repetition=repetition)
+                row = {"call": {"workload": WORKLOAD, "model": MODEL, "provider": info["arm"],
+                    "arm": info["arm"], "lc": lc, "n_inputs": len(cell["calls"]),
+                    "input_ids": [item["id"] for item in cell["calls"]],
+                    "warmup_state": warm_state, **detail}, "texts": [], "refs": []}
+            info["rows"].append(row)
+            if not row["call"]["ok"] and not C.call_refused(row["call"]):
+                break
+
+
+def _capture_stage(info: dict[str, Any], stage: str, action, key: str | None = None) -> None:
+    try:
+        value = action()
+        if key is not None:
+            info[key] = value
+    except Exception as exc:
+        _record_error(info, exc, stage)
 
 
 def run_antfly(args: argparse.Namespace, cells: list[dict[str, Any]], out: Path, lc: int) -> dict[str, Any]:
@@ -162,27 +255,29 @@ def run_antfly(args: argparse.Namespace, cells: list[dict[str, Any]], out: Path,
     info: dict[str, Any] = {"provider": "antfly", "arm": "antfly", "model": MODEL,
                             "binary": C.file_identity(args.antfly), "host_before": C.host_snapshot(),
                             "decoding": {"language": "en", "strategy": "greedy",
-                                         "timestamps": False, "audio_context": "full"}}
-    info.update(server.start())
+                                         "timestamps": False, "audio_context": "full"},
+                            "precision": C.native_precision(args.antfly, MODEL)}
+    info["rows"] = []
+    info["warmup"] = {"performed": False, "inference_count": 0, "cells": [],
+                     "state": "one independent inference per cell before its measured repetitions; same loaded process"}
     try:
-        warm_text, warm_ms = _antfly_one(server.port, requests[cells[0]["id"]])
-        info["warmup"] = {"performed": True, "ms": round(warm_ms, 3),
-                          "nonempty": bool(normalize_text(warm_text))}
-        rows = []
-        for cell in cells:
-            text, wall_ms = _antfly_one(server.port, requests[cell["id"]])
-            texts = [text]
-            rows.append({"call": _cell_row("antfly", cell, texts, wall_ms, lc,
-                         {"request_ms": [round(wall_ms, 3)],
-                          "warmup_state": "same server process after one inference warmup",
-                          "timing_basis": "pre-encoded HTTP request dispatch through complete response-body read; WAV/base64/JSON preparation excluded"}),
-                         "texts": texts, "refs": [call["ref"] for call in cell["calls"]]})
-        info["rows"] = rows
-        return info
+        info.update(server.start())
+
+        def prepare(cell):
+            def infer():
+                text, elapsed_ms = _antfly_one(server.port, requests[cell["id"]])
+                return [text], elapsed_ms, {}
+            return infer
+
+        _measure_cells(info, cells, lc, args.repetitions, prepare, lambda cell: {
+            "timing_basis": "pre-encoded HTTP request dispatch through complete response-body read; WAV/base64/JSON preparation excluded"})
+    except Exception as exc:
+        _record_error(info, exc, "lifecycle")
     finally:
-        info["host_after"] = C.host_snapshot()
-        info["footprint"] = server.stop()
-        sanitize_log(out / f"{tag}.server.log")
+        _capture_stage(info, "host_after", C.host_snapshot, "host_after")
+        _capture_stage(info, "cleanup", server.stop, "footprint")
+        _capture_stage(info, "log_cleanup", lambda: sanitize_log(out / f"{tag}.server.log"))
+    return info
 
 
 def _model_dir() -> Path:
@@ -209,8 +304,7 @@ def verify_same_weights() -> dict[str, Any]:
         raise ValueError("Whisper Transformers and Antfly source weights are not identical")
     return {"model": MODEL, "revision": REVISION, "model_safetensors_sha256": SOURCE_WEIGHT_SHA256,
             "antfly_source_match": True, "transformers_source_match": True,
-            "comparison": "SHA-256 of model.safetensors in both installed snapshots",
-            "cuda_precision_note": "Antfly CUDA stores dense projections and the embedding table as FP16 with FP32 accumulation and logits; upstream Transformers keeps the matched source weights FP32."}
+            "comparison": "SHA-256 of model.safetensors in both installed snapshots"}
 
 
 def validate_cpp_provenance(model_path: Path, provenance_path: Path) -> dict[str, Any]:
@@ -224,8 +318,8 @@ def validate_cpp_provenance(model_path: Path, provenance_path: Path) -> dict[str
     if value.get("converted_model_sha256") != converted:
         raise ValueError("whisper.cpp converted model checksum differs from provenance")
     converter = value.get("converter") or {}
-    if converter.get("name") != "whisper.cpp" or not isinstance(converter.get("revision"), str) or not converter["revision"]:
-        raise ValueError("whisper.cpp provenance needs converter name and revision")
+    if converter.get("name") != "whisper.cpp" or converter.get("revision") != CPP_REVISION:
+        raise ValueError("whisper.cpp converter must be pinned to v1.9.2")
     return {**required, "converted_model_sha256": converted,
             "converter": {"name": "whisper.cpp", "revision": converter["revision"]}}
 
@@ -243,93 +337,113 @@ def _cpp_paths() -> tuple[Path, Path, Path]:
     return binary, model, provenance
 
 
-def _parse_cpp_timings(log: str) -> dict[str, float]:
-    timings: dict[str, float] = {}
-    for name, value in re.findall(r"whisper_print_timings:\s+([a-z ]+?)\s*=\s*([0-9.]+) ms", log):
-        timings[name.strip().replace(" ", "_")] = float(value)
-    return timings
-
-def _cpp_compute_ms(timings: dict[str, float]) -> float:
-    missing = {"load_time", "total_time"} - timings.keys()
-    if missing:
-        raise ValueError(f"whisper.cpp timing output is missing {', '.join(sorted(missing))}")
-    load_ms = timings["load_time"]
-    total_ms = timings["total_time"]
-    if not math.isfinite(load_ms) or not math.isfinite(total_ms) or load_ms < 0 or total_ms <= load_ms:
-        raise ValueError("whisper.cpp load_time/total_time timing output is malformed")
-    return total_ms - load_ms
+CPP_FIELDS = {"language": "en", "translate": "false", "best_of": "1", "beam_size": "1",
+              "temperature": "0", "temperature_inc": "0", "response_format": "json",
+              "no_timestamps": "true", "audio_ctx": "0"}
 
 
-def run_cpp_arm(cells: list[dict[str, Any]], out: Path, lc: int) -> dict[str, Any]:
-    binary, model, _ = _cpp_paths()
-    rows = []
-    arm_footprints = []
-    commands = []
-    for cell in cells:
-        work = out / "cpp" / f"lc{lc}-{cell['id']}"
-        work.mkdir(parents=True, exist_ok=True)
-        output_base = work / "result"
-        command: list[str | Path] = [binary, "--model", model, "--language", "en",
-            "--no-timestamps", "--best-of", "1", "--beam-size", "1", "--temperature", "0",
-            "--temperature-inc", "0", "--no-fallback", "--output-json"]
-        command.extend(["--file", cell["calls"][0]["path"], "--output-file", output_base])
-        log_path = out / f"lc{lc}-whisper-cpp-{cell['id']}.log"
-        started = time.perf_counter()
-        process: subprocess.Popen | None = None
-        sampler: C.Sampler | None = None
-        footprint: dict[str, Any] = {}
-        with log_path.open("w", encoding="utf-8") as log:
-            try:
-                process = subprocess.Popen([str(part) for part in command], stdout=subprocess.DEVNULL,
-                                           stderr=log, start_new_session=True)
-                sampler = C.Sampler(process.pid, out, f"lc{lc}-whisper-cpp-{cell['id']}")
-                returncode = process.wait(timeout=900)
-            finally:
-                active_exception = sys.exc_info()[0] is not None
-                cleanup_error: Exception | None = None
-                if process is not None:
-                    try:
-                        C.stop_proc(process)
-                    except Exception as exc:
-                        cleanup_error = exc
-                if sampler is not None:
-                    try:
-                        footprint = sampler.stop()
-                    except Exception as exc:
-                        cleanup_error = cleanup_error or exc
-                if cleanup_error is not None and not active_exception:
-                    raise cleanup_error
-        wall_ms = (time.perf_counter() - started) * 1000
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-        log_path.write_text(log_text.replace(str(model), model.name), encoding="utf-8")
-        sanitize_log(log_path)
-        log_text = log_path.read_text(encoding="utf-8")
-        if returncode != 0:
-            raise RuntimeError(f"whisper.cpp exited {returncode}; see {log_path.name}")
-        output_path = output_base.with_suffix(".json")
-        payload = json.loads(output_path.read_text(encoding="utf-8"))
-        texts = ["".join(segment["text"] for segment in payload["transcription"]).strip()]
-        output_path.unlink()
-        timings = _parse_cpp_timings(log_text)
-        compute_ms = _cpp_compute_ms(timings)
-        rows.append({"call": _cell_row("whisper.cpp", cell, texts, compute_ms, lc,
-                    {"wall_ms": round(wall_ms, 3), "model_load_ms": timings["load_time"],
-                     "timing_basis": "required native total_time minus required native load_time",
-                     "warmup_state": "fresh process, first inference, no inference warmup",
-                     "audio_x_realtime_basis": "cold-process first-inference compute time with model load excluded",
-                     "native_timings_ms": timings}), "texts": texts,
-                     "refs": [call["ref"] for call in cell["calls"]]})
-        arm_footprints.append(footprint)
-        commands.append(C.public_command(command))
-    version = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=30)
-    footprint = max(arm_footprints,
-                    key=lambda value: value.get("process_tree_footprint_peak_bytes", 0),
-                    default={})
-    return {"provider": "whisper.cpp", "arm": "whisper.cpp", "model": MODEL,
-            "binary": C.file_identity(binary), "version": " ".join((version.stdout + version.stderr).split())[:300],
-            "commands": commands, "rows": rows, "footprint": footprint,
-            "warmup": {"performed": False, "state": "fresh process per cell; first inference is measured"},
-            "cell_footprints": arm_footprints}
+def _cpp_request(path: Path) -> tuple[bytes, str]:
+    boundary = "termite-whisper-" + os.urandom(16).hex()
+    parts = []
+    for name, value in CPP_FIELDS.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="clip.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode())
+    parts.extend([path.read_bytes(), f"\r\n--{boundary}--\r\n".encode()])
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _cpp_one(port: int, request: tuple[bytes, str]) -> tuple[str, float]:
+    body, content_type = request
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=900)
+    started = time.perf_counter()
+    try:
+        connection.request("POST", "/inference", body=body, headers={"Content-Type": content_type})
+        response = connection.getresponse()
+        raw = response.read()
+        elapsed_ms = (time.perf_counter() - started) * 1000
+    finally:
+        connection.close()
+    if response.status != 200:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        raise C.HttpResponseError(response.status, payload)
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+        raise RuntimeError("whisper.cpp inference returned a malformed successful response")
+    return payload["text"].strip(), elapsed_ms
+
+
+def _cpp_precision(model: Path, log: str) -> dict[str, Any]:
+    import struct
+    # ggml header: magic, n_vocab, n_audio_ctx/state/head/layer,
+    # n_text_ctx/state/head/layer, n_mels, ftype (12 little-endian int32s).
+    with model.open("rb") as stream:
+        header = stream.read(48)
+    if len(header) != 48:
+        raise ValueError("truncated whisper.cpp GGML model header")
+    fields = struct.unpack("<12i", header)
+    if fields[0] != 0x67676D6C:
+        raise ValueError("expected whisper.cpp GGML model")
+    observed = [line.strip() for line in log.splitlines()
+                if re.search(r"(ftype|type\s*=|backend|device|buffer|use_gpu|flash_attn)", line, re.I)]
+    return {"converted_model": C.file_identity(model), "ggml_header_ftype": fields[-1],
+            "weight_type": {0: "F32", 1: "mostly F16 (mixed tensor types)"}.get(fields[-1], "quantized/mixed; see ftype"),
+            "observed_runtime_log": observed[:100],
+            "compute_dtype": "not exposed as a complete per-operation runtime dtype audit",
+            "proof": "GGML header observed from loaded file plus server launch log; not inferred from scores"}
+
+
+def run_cpp_arm(cells: list[dict[str, Any]], out: Path, lc: int,
+                repetitions: int = 10) -> dict[str, Any]:
+    binary, model, provenance = _cpp_paths()
+    receipt = validate_cpp_provenance(model, provenance)
+    port = C.free_port()
+    tag = f"lc{lc}-whisper-cpp"
+    log_path = out / f"{tag}.log"
+    command = [str(binary), "--model", str(model), "--host", "127.0.0.1", "--port", str(port),
+               "--language", "en", "--no-timestamps", "--best-of", "1", "--beam-size", "1",
+               "--no-fallback"]
+    prepared = {cell["id"]: _cpp_request(Path(cell["calls"][0]["path"])) for cell in cells}
+    info: dict[str, Any] = {"provider": "whisper.cpp", "arm": "whisper.cpp", "model": MODEL,
+        "binary": C.file_identity(binary), "command": C.public_command(command),
+        "provenance": receipt, "decoding": CPP_FIELDS,
+        "upstream": "https://github.com/ggml-org/whisper.cpp/blob/v1.9.2/examples/server/server.cpp",
+        "context_policy": "upstream server no_context=true; independent requests, no carried text history",
+        "rows": [], "warmup": {"performed": False, "inference_count": 0, "cells": [],
+            "state": "one independent inference per cell before its measured repetitions; same loaded process"}}
+    process = sampler = None
+    started = time.perf_counter()
+    log = log_path.open("w", encoding="utf-8")
+    try:
+        try:
+            process = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True)
+            info["server_pid"] = process.pid
+            if C.memory_sampling_enabled():
+                sampler = C.Sampler(process.pid, out, tag)
+            info["ready_s"] = C.wait_http(process, port, "/health", 900, log_path.name, started)
+
+            def prepare(cell):
+                def infer():
+                    text, elapsed_ms = _cpp_one(port, prepared[cell["id"]])
+                    return [text], elapsed_ms, {}
+                return infer
+
+            _measure_cells(info, cells, lc, repetitions, prepare, lambda cell: {
+                "timing_basis": "pre-encoded multipart HTTP dispatch through complete response-body read; WAV read and multipart encoding excluded"})
+        except Exception as exc:
+            _record_error(info, exc, "lifecycle")
+        finally:
+            if sampler is not None:
+                _capture_stage(info, "sampler_cleanup", sampler.stop, "footprint")
+            _capture_stage(info, "process_cleanup", lambda: C.stop_proc(process))
+            _capture_stage(info, "log_flush", log.flush)
+            _capture_stage(info, "log_cleanup", lambda: sanitize_log(log_path))
+    finally:
+        _capture_stage(info, "log_close", log.close)
+    _capture_stage(info, "precision", lambda: _cpp_precision(model, log_path.read_text(encoding="utf-8")), "precision")
+    return info
 
 
 def _read_wav(path: Path):
@@ -340,19 +454,20 @@ def _read_wav(path: Path):
         return np.frombuffer(audio.readframes(audio.getnframes()), dtype="<i2").astype("float32") / 32768.0
 
 
-def transformers_arm(only: str | None, lc: int) -> dict[str, Any]:
+def transformers_arm(only: str | None, lc: int, repetitions: int = 10,
+                     cells: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     import torch
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-    cells = make_cells(only)
+    cells = make_cells(only) if cells is None else cells
     reference = Path(C.reference_paths()[MODEL])
     device = C.ACCEL
     processor = AutoProcessor.from_pretrained(reference, local_files_only=True)
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(reference, local_files_only=True,
-                                                       dtype=torch.float32).to(device).eval()
+    # Audit the library's load policy instead of forcing FP32 as a benchmark override.
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(reference, local_files_only=True).to(device).eval()
+    precision = C.reference_precision(model)
     recognizer = pipeline("automatic-speech-recognition", model=model, tokenizer=processor.tokenizer,
-                          feature_extractor=processor.feature_extractor, device=device,
-                          dtype=torch.float32)
+                          feature_extractor=processor.feature_extractor, device=device)
     generate = {"language": "en", "task": "transcribe", "do_sample": False, "num_beams": 1}
 
     prepared = {cell["id"]: {"raw": _read_wav(Path(cell["calls"][0]["path"])),
@@ -363,26 +478,30 @@ def transformers_arm(only: str | None, lc: int) -> dict[str, Any]:
         result = recognizer(dict(inputs), return_timestamps=False, generate_kwargs=generate)
         return [result["text"]]
 
-    infer(prepared[cells[0]["id"]])
-    rows = []
     sync = C.torch_sync(torch)
-    for cell in cells:
-        sync()
-        started = time.perf_counter()
-        texts = infer(prepared[cell["id"]])
-        sync()
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        rows.append({"call": _cell_row("transformers", cell, texts, elapsed_ms, lc,
-                    {"warmup_state": "same Python/model process after one inference warmup",
-                     "timing_basis": "ASR pipeline feature extraction, model inference, and decode; WAV file read excluded"}),
-                    "texts": texts, "refs": [call["ref"] for call in cell["calls"]]})
-    versions = {package: importlib.metadata.version(package) for package in ("torch", "transformers", "numpy")}
-    return {"provider": "transformers", "arm": "transformers", "model": MODEL,
-            "versions": versions, "dtype": "float32", "device": device,
-            "warmup": {"performed": True, "state": "one inference before measured cells"},
+    info = {"provider": "transformers", "arm": "transformers", "model": MODEL,
+            "precision": precision, "device": device, "rows": [],
+            "warmup": {"performed": False, "inference_count": 0, "cells": [],
+                       "state": "one independent inference per cell before its measured repetitions; same loaded process"},
             "decoding": {"language": "en", "task": "transcribe", "do_sample": False,
-                         "num_beams": 1, "return_timestamps": False},
-            "device_memory": C.torch_device_bytes(torch), "rows": rows}
+                         "num_beams": 1, "return_timestamps": False}}
+
+    def prepare(cell):
+        def measured():
+            sync()
+            started = time.perf_counter()
+            texts = infer(prepared[cell["id"]])
+            sync()
+            return texts, (time.perf_counter() - started) * 1000, {}
+        return measured
+
+    _capture_stage(info, "measurement", lambda: _measure_cells(
+        info, cells, lc, repetitions, prepare, lambda cell: {
+            "timing_basis": "ASR pipeline feature extraction, model inference, and decode; WAV file read excluded"}))
+    _capture_stage(info, "versions", lambda: {
+        package: importlib.metadata.version(package) for package in ("torch", "transformers", "numpy")}, "versions")
+    _capture_stage(info, "device_memory", lambda: C.torch_device_bytes(torch), "device_memory")
+    return info
 
 
 def pyarm_main(argv: list[str]) -> int:
@@ -391,10 +510,11 @@ def pyarm_main(argv: list[str]) -> int:
     parser.add_argument("--only-cell", choices=CELLS)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--lc", type=int, required=True)
+    parser.add_argument("--repetitions", type=int, default=10)
     args = parser.parse_args(argv)
     C.configure_backend(args.backend)
     try:
-        result = transformers_arm(args.only_cell, args.lc)
+        result = transformers_arm(args.only_cell, args.lc, args.repetitions)
     except Exception as exc:  # child must return a structured terminal record
         result = {"provider": "transformers", "arm": "transformers", "model": MODEL,
                   "error": public_error(exc)}
@@ -406,13 +526,18 @@ def agreement_rows(lc: int, cells: list[dict[str, Any]], results: dict[str, dict
     output = []
     for cell in cells:
         by_arm: dict[str, list[str]] = {}
+        repetitions: dict[str, list[int]] = {}
         for arm in PROVIDERS:
             result = results.get(arm) or {}
-            match = next((row for row in result.get("rows", []) if row["call"]["cell"] == cell["id"]), None)
-            if match is not None:
-                by_arm[arm] = match["texts"]
+            matches = [item for item in result.get("rows", []) if item["call"]["cell"] == cell["id"]
+                       and item["call"].get("ok", True)]
+            if matches:
+                by_arm[arm] = [text for item in matches for text in item["texts"]]
+                repetitions[arm] = [item["call"].get("repetition", 0) for item in matches]
         row: dict[str, Any] = {"workload": WORKLOAD, "model": MODEL, "lc": lc,
-                               "cell": cell["id"], "providers": list(by_arm), "complete": len(by_arm) == len(PROVIDERS)}
+                               "cell": cell["id"], "providers": list(by_arm),
+                               "complete": len(by_arm) == len(PROVIDERS)
+                               and len({tuple(values) for values in repetitions.values()}) == 1}
         if row["complete"]:
             normalized = {arm: [normalize_text(text) for text in texts] for arm, texts in by_arm.items()}
             lengths = {len(texts) for texts in normalized.values()}
@@ -444,7 +569,8 @@ def _write_arm(out: Path, result: dict[str, Any], lc: int) -> None:
             calls.write(row["call"])
             for index, text in enumerate(row["texts"]):
                 outputs.write({"workload": WORKLOAD, "model": MODEL, "provider": result["provider"],
-                               "arm": result["arm"], "lc": lc, "cell": row["call"]["cell"], "k": index,
+                               "arm": result["arm"], "lc": lc, "cell": row["call"]["cell"],
+                               "repetition": row["call"]["repetition"], "k": index,
                                "text": text, "ref": row["refs"][index]})
     finally:
         calls.close()
@@ -463,7 +589,11 @@ def orchestrate(args: argparse.Namespace) -> int:
     C.write_json(out / "model_files.json", {"transformers_and_antfly": same_weights,
                  "whisper_cpp": cpp_provenance, "whisper_cpp_binary": C.file_identity(cpp_binary)})
     C.write_json(out / "inputs.json", {"source": {"dataset": "hf-internal-testing/librispeech_asr_dummy",
-                 "revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a"},
+                 "revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a",
+                 "source_file": "clean/validation-00000-of-00001.parquet",
+                 "source_sha256": "4e69a06fa5edc90921e5e7e39a7084881f8b3ed9c805c574f4f39c6fde27c603",
+                 "license": "CC-BY-4.0", "license_url": "https://www.openslr.org/12",
+                 "construction": "one intact natural source recording per cell; no concatenation, padding, repetition or fanout"},
                  "cells": [{"id": cell["id"], "items": [{"id": call["id"], "seconds": call["seconds"],
                  "sha256": call["sha256"]} for call in cell["calls"]]} for cell in cells]})
     lifecycle_writer = C.JsonlWriter(out / "lifecycles.jsonl")
@@ -479,20 +609,20 @@ def orchestrate(args: argparse.Namespace) -> int:
                     if arm == "antfly":
                         result = run_antfly(args, cells, out, lc)
                     elif arm == "transformers":
-                        child_args = ["--backend", args.backend, "--out", str(out), "--lc", str(lc)]
+                        child_args = ["--backend", args.backend, "--out", str(out), "--lc", str(lc),
+                                      "--repetitions", str(args.repetitions)]
                         if args.only_cell:
                             child_args.extend(["--only-cell", args.only_cell])
                         result = C.run_python_arm(str(Path(__file__)), child_args, out, f"lc{lc}-transformers")
-                        sanitize_log(out / f"lc{lc}-transformers.py.log")
+                        _capture_stage(result, "log_cleanup", lambda: sanitize_log(out / f"lc{lc}-transformers.py.log"))
                     else:
-                        result = run_cpp_arm(cells, out, lc)
-                    if result.get("rc", 0) != 0 or "error" in result:
-                        failed = True
-                    else:
-                        _write_arm(out, result, lc)
+                        result = run_cpp_arm(cells, out, lc, args.repetitions)
                 except Exception as exc:
                     failed = True
                     result = {"provider": arm, "arm": arm, "model": MODEL, "error": public_error(exc)}
+                if result.get("rc", 0) != 0 or "error" in result:
+                    failed = True
+                _write_arm(out, result, lc)
                 results[arm] = result
                 lifecycle = {key: value for key, value in result.items() if key != "rows"}
                 lifecycle.update({"workload": WORKLOAD, "model": MODEL, "provider": arm, "lc": lc,
@@ -504,7 +634,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     finally:
         lifecycle_writer.close()
         agreement_writer.close()
-    complete = C.benchmark_complete(out, set(PROVIDERS), args.lifecycles, len(cells))
+    complete = C.benchmark_complete(out, set(PROVIDERS), args.lifecycles, len(cells) * args.repetitions)
     return 1 if failed or not complete else 0
 
 
@@ -518,11 +648,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--antfly", type=Path, required=True)
     run.add_argument("--backend", choices=["auto", "cuda", "metal"], default="auto")
     run.add_argument("--lifecycles", type=int, default=3)
+    run.add_argument("--repetitions", type=int, default=10)
     run.add_argument("--out", type=Path, required=True)
     run.add_argument("--only-cell", choices=CELLS)
     args = parser.parse_args(argv)
-    if args.lifecycles < 1:
-        parser.error("--lifecycles must be positive")
+    if args.lifecycles < 1 or args.repetitions < 1:
+        parser.error("--lifecycles and --repetitions must be positive")
     return orchestrate(args)
 
 

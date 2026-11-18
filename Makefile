@@ -11,11 +11,13 @@ REFERENCE_SNAPSHOTS ?= $(DATA_DIR)/reference_snapshots.json
 RESULTS_DIR         ?= $(CURDIR)/results
 OUTPUT              ?= $(RESULTS_DIR)/run
 LLAMA_SERVER        ?= $(CURDIR)/.cache/bin/llama-server
-WHISPER_CPP         ?= $(CURDIR)/.cache/bin/whisper-cli
+WHISPER_CPP         ?= $(CURDIR)/.cache/bin/whisper-server
 WHISPER_CPP_MODEL   ?= $(DATA_DIR)/references/whisper-small-whispercpp-v1.9.2/ggml-model.bin
 WHISPER_CPP_PROVENANCE ?= $(WHISPER_CPP_MODEL).provenance.json
 CUDA_ARCHITECTURES  ?= native
 LIFECYCLES          ?= 3
+MEMORY_LIFECYCLES   ?= 3
+REPETITIONS         ?= 10
 WORKLOAD            ?=
 MODEL               ?=
 CELL                ?=
@@ -38,7 +40,7 @@ RUN_ENV := env \
 	TERMITE_WHISPER_CPP_MODEL="$(WHISPER_CPP_MODEL)" \
 	TERMITE_WHISPER_CPP_PROVENANCE="$(WHISPER_CPP_PROVENANCE)"
 COMMON_ARGS := --binary "$(ANTFLY_BIN)" --backend "$(BACKEND)" --models-dir "$(MODELS_DIR)"
-RUN_ARGS := $(COMMON_ARGS) --output "$(OUTPUT)" --lifecycles "$(LIFECYCLES)"
+RUN_ARGS := $(COMMON_ARGS) --output "$(OUTPUT)" --lifecycles "$(LIFECYCLES)" --memory-lifecycles "$(MEMORY_LIFECYCLES)" --repetitions "$(REPETITIONS)"
 ifneq ($(strip $(WORKLOAD)),)
 RUN_ARGS += --workload "$(WORKLOAD)"
 endif
@@ -66,7 +68,8 @@ help: ## Show commands without changing the system
 	  '  make check ANTFLY_BIN=/path/to/antfly BACKEND=metal|cuda' \
 	  '      Check prerequisites without downloading or running measurements.' \
 	  '  make run ANTFLY_BIN=/path/to/antfly BACKEND=metal|cuda OUTPUT=results/name' \
-	  '      Run all six paired workloads. Add WORKLOAD, MODEL, CELL, or LIFECYCLES.' \
+	  '      Run quality, speed, and isolated memory. Select WORKLOAD, MODEL, or CELL.' \
+	  '      LIFECYCLES=3 MEMORY_LIFECYCLES=3 REPETITIONS=10 (speech/OCR calls).' \
 	  '  make test' \
 	  '      Run deterministic harness tests; no models or Antfly process required.' \
 	  '' \

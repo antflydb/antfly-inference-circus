@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "evidence_scope": "Conditional source policies, not runtime tensor/kernel introspection. Checkpoint inventories are separate measurements; a model name, checkpoint dtype, or output dtype does not establish compute precision. Applies to the named native inference routes, not training, ONNX, reference frameworks, or replacement artifacts.",
+  "executables": {
+    "c8f04db1564bf8a82d39999cb7f64798685bfbfa806827a7c41055c9bfe09e7d": {
+      "release": "v0.3.1",
+      "platform": "darwin-arm64",
+      "source_commit": "30b018e12419f7b43dd36ef29e6ebab2a53338ff",
+      "mapped_model_file_scope": {
+        "scope": "Native loader-owned original checkpoint windows in single/sharded safetensors/GGUF/projector stores, plus native-owned unlinked temporary file-backed repacked weight storage; not every process mapping or GPU allocation.",
+        "mapping_policy": "MmapRegion.initLimited opens the original file descriptor and calls std.posix.mmap(null,size,READ,MAP_SHARED,fd,0); initFromFile uses the same ordinary POSIX mapping on an acquired descriptor. Safetensors returns borrowed tensor slices when aligned, otherwise copies. GGUF retains its MmapRegion and returns raw/dense borrowed views or allocated materializations. No submap is explicitly constructed by these loader paths.",
+        "lifetime_policy": "Safetensors readers and GGUF stores own the original mapping until deinit. Sharded source retains one reader per opened shard. Metal cached native dense bytes increment lazy-entry pin_count, so releasing a request handle does not release their backing. archClose stops prefetch and destroys boundary residency/shared native provider before lazy weights and tensor_store. ProjectorStore owns its GGUF store until model close; request projector weights release dynamic slots before tensors. NoCopy wrappers use existing mapped addresses with deallocator:nil; they do not transfer mapping ownership to Metal.",
+        "temporary_storage_policy": "mmapTempCopy creates /tmp/{prefix}-{pid}-{monotonic_counter}.bin with O_RDWR|O_CREAT|O_EXCL mode0600, immediately unlinks it, ftruncates and writes the payload, then maps READ|MAP_SHARED at offset0. The open FD and mapping transfer into QuantizedStorage.raw_mmap_region and remain owned until QuantizedStorage.deinit calls MmapRegion.deinit (munmap then close owned FD). Production native callsites are Metal runtime repacked Q8 staging (prefix termite-q8-runtime), repacked LM-head storage (termite-q4-lm-head), and duplication of storage already owning a temporary map (termite-quant-dup). Repacked staging defaults to mmap at>=16 MiB (TERMITE_METAL_Q8_RUNTIME_STAGING_MMAP_MIN_MB); failures/smaller staging use allocated bytes instead. These are new ordinary POSIX mappings, not remaps of original checkpoint windows.",
+        "accounting_policy": "A region reader may describe VM-object residency for original checkpoint and owned unlinked regular-file windows, inclusive of file-cache residency without a task PTE; this is not a working set or minimum required RAM. A generic symmetric collector may identify unlinked regular files from kernel vnode identity/nlink==0 and S_ISREG rather than native filename heuristics; actual kernel visibility must be exercised separately. Converted/copied anonymous host/device buffers belong to allocation accounting. Do not sum mapped lengths, double-count NoCopy aliases or ledger-overlapping file pages, or add independently sampled maxima.",
+        "limitations": [
+          "This is source proof of native loader-owned original and temporary windows, not proof that Apple's closed Metal implementation never creates aliases/submaps; arbitrary driver aliases and total physical/process RAM are not audited.",
+          "Dirty MAP_SHARED temporary pages are not guaranteed to be charged by an anonymous/physical-footprint allocation ledger. Excluding them from both ledger and file-backed residency would undercount active model storage. If unlinked file-backed windows cannot be enumerated/identified/residency-queried reliably, affected memory results must remain unavailable with raw diagnostics retained.",
+          "Runtime pathname/region enumeration, identity matching, race handling, residency-query validity, and actual allocation-ledger coverage require separate runtime evidence. Source mapping provenance alone does not validate a memory sample."
+        ],
+        "sources": [
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/util/c_file.zig#L137-L170",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/util/c_file.zig#L268-L329",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/safetensors.zig#L270-L338",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/weight_source.zig#L374-L386",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/tensor_store.zig#L413-L430",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/tensor_store.zig#L528-L593",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L5205-L5222",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L12497-L12522",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/gemma4_projector.zig#L553-L606",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L34134-L34151",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_runtime.zig#L11954-L11993",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/weight_source.zig#L177-L187",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_runtime.zig#L1198-L1201",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_runtime.zig#L12088-L12091",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_runtime.zig#L26235-L26264"
+        ]
+      },
+      "models": {
+        "google/embeddinggemma-2": {
+          "metal": {
+            "conditions": "Native embedding_gemma2 architecture with the Metal hosted backend; accepted dense source tensors are BF16 or F32. Text encoder, vision/audio towers and output projection must be distinguished from CUDA's specialized BF16 encoder.",
+            "checkpoint_storage": "Source validation admits BF16/F32; actual files and tensor inventories must be measured separately.",
+            "parameter_storage": "Original mapped encoding may remain on the host tier. Metal sets require_f32_linears for embedding_gemma2. Prepared reusable projection snapshots are F32, including separate vision/audio cache classes; native source encoding is not the prepared compute dtype.",
+            "activations": "Architecture's generic encoder keeps activations F32; Metal embedding vision policy selects the full-F32 flash variant rather than Qwen/Gemma half-operand flash. Audio/vision source weights can be BF16 while projection snapshots and graph intermediates are F32.",
+            "accumulation": "Full-F32 vision shader uses float tiles and simdgroup_float8x8 accumulators. Prepared MPS linears use F32 input/weight/result descriptors. Closed MPS internal arithmetic and device-selected instructions are not introspected.",
+            "cache": "Bidirectional embedding encoder has no autoregressive decoder KV cache. Source-backed weight pins and prepared F32 text/vision/audio snapshots are weight caches, not KV.",
+            "limitations": "Prepared-cache admission, shape eligibility and diagnostic disables can change scheduling/fallbacks; this does not prove every observed request used a particular shader or every vendor instruction accumulated identically.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/embedding_gemma2.zig#L16-L18",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/embedding_gemma2.zig#L105-L109",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L6733-L6735",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L7105-L7177",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L19897-L19918",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L14823-L14840",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L54294-L54307"
+            ]
+          }
+        },
+        "fastino/gliner2.5-base-v1": {
+          "metal": {
+            "conditions": "Native GLiNER2.5 boundary safetensors/FP32 artifact route. Reduced GGUF profiles are different identities and are not described as the same FP32 policy.",
+            "checkpoint_storage": "The safetensors boundary validator requests fp32 and the resident owner rejects any tensor not F32 before publishing device weights.",
+            "parameter_storage": "Resident boundary owner verifies artifact digest, descriptors and finite F32 values, then uploads unchanged raw four-byte values. Encoder and boundary heads share this immutable FP32 owner; packed QKV is a rearrangement, not a reduced checkpoint.",
+            "activations": "Boundary executor uses F32 device tensors; this is not inferred from a checkpoint dtype alone.",
+            "accumulation": "FP32 boundary executor contract; no blanket assertion about all closed Metal/MPS implementation instructions. Reduced boundary arithmetic has separate entrypoints and artifact precision admission.",
+            "cache": "Encoder/boundary-head inference, not an autoregressive decoder; resident weights/packed QKV and request scratch must not be labeled decoder KV.",
+            "limitations": "Artifact identity/route must match. This does not attest runtime kernel traces or make an FP32 claim for separately qualified reduced artifacts.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L334-L374",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/gliner_boundary_resident.zig#L134-L135",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/gliner_boundary_resident.zig#L223-L283",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/gliner_boundary_resident.zig#L446-L456",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L9669-L9677",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L12817-L12841"
+            ]
+          }
+        },
+        "fastino/GLiNER2.5-Decide": {
+          "metal": {
+            "conditions": "Exact qualified original DeBERTa Decide identity, not Decide-1B or Q8: 419 all-F32 tensors; model.safetensors SHA256 40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997 plus pinned geometry, markers and sidecars.",
+            "checkpoint_storage": "F32 is part of source qualification for this identity, not a statement that Metal computes the whole model with F32 parameters.",
+            "parameter_storage": "Decision path calls DeBERTa forwardCt with weight mirrors enabled. Ordinary capped encoder projection mirrors default to F16 MPS (24 layers, hidden1024/intermediate4096: 576 MiB F16 mirrors, below default768 MiB cap). Source F32 embeddings/norms/bias/relative-position and decision-head parameters are not globally narrowed by that encoder mirror preference.",
+            "activations": "Dense MPS projection input/result descriptors are F32 even when the encoder weight descriptor is F16. Decision logits are converted/read out as F32. Do not label this whole model FP16 or whole-model FP32.",
+            "accumulation": "Native reductions/graph values are F32; MPS public descriptors establish operand/result storage, not closed-library internal accumulator implementation.",
+            "cache": "Bidirectional encoder and decision head: no decoder KV. Relative-position/index and weight mirrors are distinct caches.",
+            "overrides": "TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS disables ordinary mirrors; TERMITE_METAL_DEBERTA_WEIGHT_MIRROR_MAX_MB defaults768. Within enabled mirrors, USE_Q8_MIRRORS wins over USE_BF16_MIRRORS, then USE_F32_MIRRORS, otherwise F16 MPS (all have TERMITE_METAL_DEBERTA_ prefix). Qualified specialty require_f32 policy bypasses diagnostics/cap but is not inferred for this ordinary Decide path.",
+            "limitations": "Shape/admission/MPS availability determine whether mirrors are actually used. Neither F32 checkpoint storage nor F32 output proves uniform F32 matrix operands.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/gliner_decide_qualification.zig#L74-L81",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/gliner_decide_qualification.zig#L108-L129",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/deberta.zig#L109-L169",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L10730-L10754",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L19897-L19918"
+            ]
+          }
+        },
+        "google/gemma-4-E4B-it-qat-q4_0-gguf": {
+          "metal": {
+            "conditions": "Native Gemma4 GGUF decoder plus separately loaded media/projector GGUF when the request uses media. Tensor-type inventory, request cache dtype and dispatch shape matter; Q4_0 in the model name is not a whole-model compute dtype.",
+            "checkpoint_storage": "GGUF per-tensor block/dense types; source store retains quantized raw bytes and returns dense native views/materializations according to each tensor type. Actual GGUF and projector inventories are required separately.",
+            "parameter_storage": "Decoder quantized storage remains available to quantized kernels; dense safetensors/GGUF F16/BF16 matrices can retain native backing. GGUF projector loadTensorF32 preserves source F32 or widens F16/BF16, then Metal uploads F32 via fromFloat32Shape. Decoder and projector must not be given a shared blanket Q4 parameter dtype.",
+            "activations": "F32 graph interfaces with shape-/kernel-specific reduced internal operands; quantized decoder has explicit F16 input/output stage variants. Vision's eligible hd64 flash uses half Q/K/V/probability tiles and F32 output. This is not uniform F32 arithmetic merely because graph tensors are F32.",
+            "accumulation": "Quantized fused prefill candidates retain F32 accumulators; eligible vision flash uses simdgroup_float8x8 accumulators with half operands. Other tensor formats and vendor routines retain independent dispatch; no claim of exhaustive instruction-level auditing.",
+            "cache": "Gemma4 recommended Metal KV dtype is F16, subject to Metal Gemma override/request configuration. This is a recommendation until the server/request configuration is recorded; not a claim that every run used F16. Weight caches and projected media tensors are separate from decoder KV.",
+            "limitations": "No single bit-width describes decoder quantization, dense auxiliary tensors, projector, activation staging and KV. Runtime selections and every alternative quantized microkernel are not introspected; exact kernel path must not be reported as measured from this source record.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/tensor_store.zig#L552-L593",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L5147-L5163",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/gemma4_projector.zig#L6209-L6237",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/gemma4_projector.zig#L6531-L6599",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_runtime.zig#L13381-L13416",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L786-L788",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L14794-L14818",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L54288-L54307",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L9163-L9187"
+            ]
+          }
+        },
+        "openai/whisper-small": {
+          "metal": {
+            "conditions": "Native Whisper with F32 source tensors. Native dense-preservation helper only preserves existing F16/BF16 matrices; it does not itself narrow F32 Whisper matrices.",
+            "checkpoint_storage": "Actual checkpoint tensor inventory is separate; this source policy is conditional on the F32 checkpoint, not a model-name dtype assertion.",
+            "parameter_storage": "F32 weights are borrowed when the immutable aligned-F32 policy admits them or materialized as F32. Existing lower-precision replacement matrices would follow their own native-preservation route, outside this F32-source condition.",
+            "activations": "F32 graph tensors and logits. Encoder attention calls Qwen3VlVision attention; eligible hd64 unmasked layout1 flash (sequence>256, within the selector limit) stages Q/K/V and probabilities as half, accumulates/returns F32. Thus F32 checkpoint storage does not establish all-F32 Whisper Metal compute.",
+            "accumulation": "Eligible vision-style encoder flash uses F32 simdgroup matrices with half operands; dense MPS exposes F32 result descriptors. Closed vendor arithmetic is not runtime-introspected.",
+            "cache": "Whisper allocates decoder self-K/V slabs with allocUninitF32Shape. Cross-K/V are resident projection results; optional backend narrowing hook is implemented in CUDA, not established as a Metal narrowing path by this audit. No blanket cache precision inference from checkpoint dtype.",
+            "limitations": "Flash eligibility and diagnostics change the attention route. This record does not certify an all-F32 end-to-end model or all possible fallback kernels.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L5147-L5163",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L29062-L29080",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L29127-L29144",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/whisper.zig#L253-L257",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/whisper.zig#L859-L915",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L14794-L14818",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L54288-L54307"
+            ]
+          }
+        },
+        "lightonai/LightOnOCR-3-0.8B": {
+          "metal": {
+            "conditions": "Native LightOnOCR3/Qwen3.5 image encoder and recurrent/attention decoder, conditional on BF16 source matrices. Not a blanket BF16 compute policy.",
+            "checkpoint_storage": "Actual safetensors inventory is separate evidence; native dense helper admits existing BF16/F16 rank2 tensors and the special rank3 vision position table without narrowing F32 tensors.",
+            "parameter_storage": "Eligible native BF16 matrix backing remains compact; prepared recurrent projection slots retain backing leases and discard otherwise idle F32 mirrors. Norm weights/other F32-only consumers can materialize F32; prepared recurrent state and graph input are explicitly checked F32.",
+            "activations": "F32 graph/recurrent state is distinct from kernel operands. Eligible vision flash/packed MPP uses half Q/K/V/probabilities with F32 accumulation/output. Ordinary decoder projection paths preserve F32 inputs, but TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS or TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS can stage BF16 operands. BF16 prefill-input option excludes active decode and the out-of-frame LM head; geometry/pipeline/OS/admission gates still apply.",
+            "accumulation": "Audited vision flash and small projection tiles use F32 accumulators/output. Source preserves distinct F32-input and BF16-input MPP variants; closed TensorOps/MPS internals are not an observed kernel trace.",
+            "cache": "Reader/session recommendation on Metal is F16 decoder KV, subject to caller configuration; recurrent convolution/matrix state remains F32 in the inspected prepared path. KV and recurrent state must not be collapsed to one dtype.",
+            "limitations": "Media attention is mixed even when the graph interface is F32. Exact production dispatch, all alternate fused recurrent kernels and vendor instruction choices are not established by checkpoint inventory or this source-only policy.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L5147-L5163",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/metal_compute.zig#L1998-L2040",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L41573-L41582",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L41674-L41750",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/backends/metal_kernels.m#L54344-L54365",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/qwen3vl_projector.zig#L2070-L2074",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L9163-L9187"
+            ]
+          }
+        }
+      }
+    },
+    "29d66211c3c0564464ec73fbdb2f513397885172c7388a5c1c3b03830dcdcdc9": {
+      "release": "v0.3.1",
+      "platform": "linux-x86_64-gnu-cuda",
+      "source_commit": "30b018e12419f7b43dd36ef29e6ebab2a53338ff",
+      "mapped_model_file_scope": {
+        "scope": "Original native safetensors/sharded safetensors/GGUF file-store mappings, not CUDA VRAM, pinned host allocations, arbitrary driver mappings or total physical RAM.",
+        "mapping_policy": "The same native MmapRegion POSIX read-only MAP_SHARED loader owns original file windows. Safetensors and GGUF retain those mappings while borrowed host tensor slices are live; CUDA upload creates distinct device storage rather than changing checkpoint storage dtype in place.",
+        "limitations": "No Linux residency or GPU memory measurement is implied by this source proof. Original file-cache residency, copied/converted buffers and CUDA allocations require their respective collectors; no file-size sum or independent-peak addition is justified.",
+        "sources": [
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/util/c_file.zig#L137-L170",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/safetensors.zig#L270-L338",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/weight_source.zig#L374-L386",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/tensor_store.zig#L413-L430",
+          "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L7207-L7228"
+        ]
+      },
+      "models": {
+        "google/embeddinggemma-2": {
+          "cuda": {
+            "conditions": "Native embedding_gemma2 CUDA profile requires compute capability>=8. Specialized text encoder differs from generic F32 architecture/Metal path; vision/audio have separate execution gates.",
+            "checkpoint_storage": "Validator admits BF16/F32; actual tensor inventory is separate.",
+            "parameter_storage": "BF16 rank>=2 weights upload compactly; specialized encoder obtains BF16 weights directly or creates/caches BF16 mirrors for F32 source tensors. Audio subsampler rank4 BF16 convolution filters are widened to F32 for the F32 convolution kernel; rank1/general consumers can be F32.",
+            "activations": "Specialized encoder initializes BF16 immutable/hidden/projection arenas and casts F32 input embeddings to BF16. Encoder output projection is BF16 before F32 mean/L2 sentence output. Vision routes can use BF16 attention/matmul; audio F32 frontend/convolution and separately gated BF16 audio operations must not be mislabeled all-BF16.",
+            "accumulation": "cuBLASLt BF16 matmul uses BF16 inputs/output with CUBLAS_COMPUTE_32F accumulation. Fallback native kernels and separately selected media paths are not claimed to be that vendor kernel. F32 final output does not establish F32 internal activations.",
+            "cache": "No autoregressive decoder KV; BF16 mirrors/packed projections/replay arenas are weight/execution caches.",
+            "limitations": "Actual native/cuBLASLt/cuDNN fallback selection and optional media routes are conditional on device, libraries, artifact kernels, shape and configured embedding_gemma2_policy. Not runtime dtype introspection.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L490-L493",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L4595-L4625",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L5148-L5184",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L6953-L6968",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L11746-L11748",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L11827-L11844",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L28512-L28515",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L477-L479",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L813-L821"
+            ]
+          }
+        },
+        "fastino/gliner2.5-base-v1": {
+          "cuda": {
+            "conditions": "Native gliner25_boundary CUDA profile with canonical FP32 boundary artifact. Reduced boundary bundles are rejected for this profile, not silently treated as equivalent.",
+            "checkpoint_storage": "Safetensors boundary validation requires FP32; reduced artifact admission is independent.",
+            "parameter_storage": "Session sets strict_f32_weights for gliner25_boundary. Upload rejects quantized storage on this strict path and either uploads F32 directly or widens supported dense values before F32 upload; applies to resident encoder/head weights.",
+            "activations": "Strict profile uses F32 graph tensors and strict F32 matrix operands rather than inferring reduced arithmetic from source storage.",
+            "accumulation": "Eligible strict cuBLASLt linears use F32 operands with CUBLAS_COMPUTE_32F. cuBLAS math mode is CUBLAS_DEFAULT_MATH (source explicitly excludes TF32); native F32 fallbacks remain separate routes.",
+            "cache": "Encoder/boundary heads have no autoregressive decoder KV; resident weight/scratch caches are separate.",
+            "limitations": "Does not claim observed cuBLASLt dispatch, instruction traces, or policies for reduced boundary artifacts.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L334-L360",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L2120-L2124",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L2255-L2272",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L6837-L6843",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L12562-L12588",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L1398-L1428",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/libraries.zig#L185-L188"
+            ]
+          }
+        },
+        "fastino/GLiNER2.5-Decide": {
+          "cuda": {
+            "conditions": "Exact original DeBERTa Decide qualification: 419 all-F32 tensors and model.safetensors SHA256 40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997 plus pinned geometry/markers/sidecars. Q8 and Decide-1B are different variants.",
+            "checkpoint_storage": "All-F32 inventory is required by this exact source identity.",
+            "parameter_storage": "Session sets qualified_decide_fp32 and strict_f32_weights for this variant, not the Q8 F16-mirror path. Resident encoder and decision head remain F32 through strict upload.",
+            "activations": "F32 graph/matrix operands and F32 decision logits. Qualified Decide forces fused_f32 DeBERTa attention even if reduced-precision diagnostics request otherwise.",
+            "accumulation": "Strict F32 cuBLASLt operands with CUBLAS_COMPUTE_32F; cuBLAS default math disables TF32. Fused attention is source-selected F32, not inferred from all-F32 checkpoint alone.",
+            "cache": "No autoregressive decoder KV; encoder position/index, weight and attention scratch caches are separate.",
+            "limitations": "FP32 policy is identity-bound and not transferable to Q8/1B artifacts; actual vendor/native kernel dispatch is not measured here.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/gliner_decide_qualification.zig#L74-L81",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/models/gliner_decide_qualification.zig#L108-L129",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L2248-L2277",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L6837-L6843",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L18883-L18885",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L27498-L27499",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L813-L821",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/libraries.zig#L185-L188"
+            ]
+          }
+        },
+        "google/gemma-4-E4B-it-qat-q4_0-gguf": {
+          "cuda": {
+            "conditions": "Native dense Gemma4 E4B GGUF decoder; specialized sm89 policy only when compute capability8.9 and eligible dense E4B geometry. Media/projector path is separately conditioned.",
+            "checkpoint_storage": "GGUF per-tensor quantized/dense types, not all-Q4 compute. Actual decoder/projector inventories are separate evidence.",
+            "parameter_storage": "Default load-plan retains quantized matrices; full dequantization, Q4_0->BF16 upload and retained BF16 prefill mirrors default false (TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS, ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q4_0_MATRIX_WEIGHTS_BF16, ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL). Small affine/norm/bias tensors materialize F32. Eligible sm89 10752x2560 PLE model projection retains source F16 by default when the complete F16 route exists; ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16 defaults false. Projector compact F16/BF16 upload defaults on only for qualified sm89, correct orientation; otherwise projector loads widen to F32.",
+            "activations": "F32 graph representation with conditional BF16 quantized prefill operands and F16 dense prefill staging. PLE singleton sm89 decode widens F16 weights while preserving F32 input/reduction order. Qualified sm89 vision attention defaults to F16 operands/F32 output for batch<=4, sequence<=3136,12heads,dim64; explicit rollback keeps F32 fallback.",
+            "accumulation": "cuBLASLt dense reduced-operand paths use CUBLAS_COMPUTE_32F; qualified vision uses F32 accumulation/output. Quantized decode/prefill kernels are distinct; no claim that every quantized format has identical operand quantization or every request selected cuBLASLt.",
+            "cache": "Gemma4 CUDA recommended KV is F16; request configuration must establish actual cache dtype. No inference of cache precision from Q4 checkpoint.",
+            "limitations": "Raw Q4 prefill defaults on only for qualified sm89 with available kernel and tensor-core request; other devices/flags select different quantized paths. This source audit is not exhaustive instruction-level auditing of every generated quantized kernel or vendor library.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L2239-L2244",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/load_plan.zig#L19-L56",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L6014-L6026",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L8445-L8476",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L8655-L8685",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L12506-L12525",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L20577-L20595",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L25898-L25929",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/gemma4_projector.zig#L6494-L6527",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L813-L821",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L9163-L9187"
+            ]
+          }
+        },
+        "openai/whisper-small": {
+          "cuda": {
+            "conditions": "Native Whisper CUDA profile; ANTFLY_CUDA_WHISPER_F16_WEIGHTS defaults true. F16 dense residency additionally requires cuBLASLt enabled/loaded, compute capability>=8, F32->F16 and F16 GEMV/embedding kernels. The profile itself admits CC7.5, so F16 residency must not be asserted merely from successful loading.",
+            "checkpoint_storage": "Actual checkpoint inventory is separate. For F32 source matrices, the uploader explicitly narrows eligible rank2 *.weight tensors; F32 source does not imply F32 execution.",
+            "parameter_storage": "Eligible rank2 dense projections and embedding table become F16 with finite-value checks. Norms/biases and rank3 convolution filters remain F32. Without complete F16 route/flag, generic F32 upload remains.",
+            "activations": "F32 graph values/logits, but tensor-core matrix operations stage F16 operands. Whisper singleton GEMV explicitly rounds input through half then widens to float before FMA with half weights. Encoder hd64 sequence<=1500 attention prefers default-on ANTFLY_CUDA_WHISPER_CUDNN F16 SDPA, with tiled F16 fallback; never infer BF16 from shared vision entrypoint name.",
+            "accumulation": "Whisper GEMV uses float FMA/reductions/output after F16 input rounding; cuBLASLt F16 matmul requests CUBLAS_COMPUTE_32F and F32 output. Vendor SDPA internal instruction arithmetic is not introspected.",
+            "cache": "Decoder self-K/V slabs are F32. whisperPrepareCrossKv narrows cross-K/V F32 projections to F16 whenever whisper_f16_weights_enabled is true; that hook checks the flag/profile independently of dense-residency device gates. Logits-stats path requires F32 logits.",
+            "limitations": "Not all-FP32 and not all-FP16. Dense-residency flag, encoder-attention route and cross-cache hook have different conditions; record actual environment/device before selecting a concrete run label.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L490-L493",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L5470-L5475",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L6969-L6988",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L8467-L8476",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L25799-L25816",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L28318-L28350",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/whisper_kernels.cu#L172-L205",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L514-L529",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L813-L821",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/whisper.zig#L888-L915"
+            ]
+          }
+        },
+        "lightonai/LightOnOCR-3-0.8B": {
+          "cuda": {
+            "conditions": "Native lightonocr3 CUDA profile (CC>=8), conditional on BF16 source matrices. Image tower, recurrent decoder state, matrix staging and attention/KV are separate policies.",
+            "checkpoint_storage": "Actual safetensors inventory must be recorded independently.",
+            "parameter_storage": "Generic uploader keeps BF16 rank>=2 tensors compact on device; rank1/general F32-only consumers widen to F32. BF16 parameter storage is not a whole-model activation/accumulator dtype.",
+            "activations": "ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE defaults f32; bf16_vision enables compact BF16 vision-block activations only with attention enabled and supported device/kernels/shape. Even the f32 graph profile's shared vision attention defaults to BF16 tensor-core operands via ANTFLY_INFERENCE_CUDA_QWEN3VL_VISION_ATTENTION_TC_BF16=true, with F32 graph output; disabling that gate restores generic SDPA. ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN is a separate route gate. Recurrent/decoder arithmetic retains its F32 base policy, not the vision profile's dtype.",
+            "accumulation": "Reduced cuBLASLt operands use CUBLAS_COMPUTE_32F. F32 default profile describes graph/recurrent arithmetic, not proof that every attention/matrix operation uses F32 operands. Alternate vendor/fused kernels require their own runtime dispatch evidence.",
+            "cache": "Session recommends F16 decoder KV on CUDA, subject to caller/request configuration; recurrent state and KV must not be conflated. Default f32 precision profile does not force F32 KV.",
+            "limitations": "BF16 vision override is device/driver/library/geometry dependent; public source does not establish which fused recurrent/prefill or vendor attention implementation an actual request selected. No blanket BF16-checkpoint=BF16-compute claim.",
+            "sources": [
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L490-L493",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L5475-L5478",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L6966-L6968",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L7006-L7015",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.zig#L16-L28",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.zig#L57-L85",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L25780-L25785",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cuda_compute.zig#L25819-L25856",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/qwen3vl_projector.zig#L2070-L2074",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/ops/cuda/cublaslt.zig#L813-L821",
+              "https://github.com/antflydb/antfly/blob/30b018e12419f7b43dd36ef29e6ebab2a53338ff/zig/pkg/inference/src/architectures/session_factory.zig#L9163-L9187"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

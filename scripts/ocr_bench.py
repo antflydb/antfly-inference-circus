@@ -191,6 +191,66 @@ def _cell_row(arm: str, cell: dict[str, Any], texts: list[str], elapsed_ms: floa
     return row
 
 
+def _record_error(info: dict[str, Any], exc: Exception, stage: str, **identity: Any) -> dict[str, Any]:
+    fields = exc.call_fields() if isinstance(exc, C.HttpResponseError) else {
+        "ok": False, "error": public_error(exc)}
+    refused = C.call_refused(fields)
+    detail = {**identity, **fields, "stage": stage, "state": "refused" if refused else "failed"}
+    info.setdefault("errors", []).append(detail)
+    if not refused:
+        info.setdefault("error", fields["error"])
+    return detail
+
+
+def _measure_cells(info: dict[str, Any], cells: list[dict[str, Any]], lc: int,
+                   repetitions: int, prepare, extra) -> None:
+    """Keep actual attempts and completed siblings even when a later cell fails."""
+    for cell in cells:
+        try:
+            infer = prepare(cell)
+        except Exception as exc:
+            _record_error(info, exc, "prepare", cell=cell["id"])
+            continue
+        warm_state = "complete"
+        try:
+            _, elapsed_ms, _ = infer()
+            info["warmups"].append({"cell": cell["id"], "state": "complete",
+                "ms": round(elapsed_ms, 3), "pages": len(cell["calls"]), "measured": False})
+        except Exception as exc:
+            detail = _record_error(info, exc, "warmup", cell=cell["id"])
+            info["warmups"].append({**detail, "measured": False})
+            warm_state = detail["state"]
+            if warm_state != "refused":
+                continue
+        for repetition in range(repetitions):
+            try:
+                texts, elapsed_ms, details = infer()
+                if len(texts) != len(cell["calls"]):
+                    raise ValueError("OCR page count differs from request")
+                call = _cell_row(info["arm"], cell, texts, elapsed_ms, lc, {
+                    **extra(cell), **details, "repetition": repetition,
+                    "warmup_state": warm_state})
+                row = {"call": call, "texts": texts, "refs": [item["ref"] for item in cell["calls"]]}
+            except Exception as exc:
+                detail = _record_error(info, exc, "measured", cell=cell["id"], repetition=repetition)
+                row = {"call": {"workload": WORKLOAD, "model": MODEL, "provider": info["arm"],
+                    "arm": info["arm"], "lc": lc, "n_inputs": len(cell["calls"]),
+                    "input_ids": [item["id"] for item in cell["calls"]],
+                    "warmup_state": warm_state, **detail}, "texts": [], "refs": []}
+            info["rows"].append(row)
+            if not row["call"]["ok"] and not C.call_refused(row["call"]):
+                break
+
+
+def _capture_stage(info: dict[str, Any], stage: str, action, key: str | None = None) -> None:
+    try:
+        value = action()
+        if key is not None:
+            info[key] = value
+    except Exception as exc:
+        _record_error(info, exc, stage)
+
+
 def _antfly_read(port: int, body: dict[str, Any]) -> tuple[list[str], float, dict[str, Any]]:
     encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=900)
@@ -202,10 +262,16 @@ def _antfly_read(port: int, body: dict[str, Any]) -> tuple[list[str], float, dic
         elapsed_ms = (time.perf_counter() - started) * 1000
     finally:
         connection.close()
+    if response.status != 200:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        raise C.HttpResponseError(response.status, payload)
     payload = json.loads(raw) if raw else {}
     data = payload.get("data") if isinstance(payload, dict) else None
-    if response.status != 200 or not isinstance(data, list) or not all(isinstance(row.get("text"), str) for row in data):
-        raise RuntimeError(f"Antfly read failed status={response.status} error={payload.get('error')!r}")
+    if not isinstance(data, list) or not all(isinstance(row, dict) and isinstance(row.get("text"), str) for row in data):
+        raise RuntimeError("Antfly read returned a malformed successful response")
     return [row["text"] for row in data], elapsed_ms, {
         "response_bytes": len(raw), "usage": payload.get("usage"),
         "execution": payload.get("execution")}
@@ -216,27 +282,40 @@ def run_antfly(args: argparse.Namespace, cells: list[dict[str, Any]], out: Path,
     server = C.AntflyServer(args.antfly, out, tag, models_dir=C.MODELS_DIR,
                            extra_args=["--scratch-budget-mb", os.environ.get("TERMITE_SCRATCH_BUDGET_MB", "8192")])
     info: dict[str, Any] = {"provider": "antfly", "arm": "antfly", "model": MODEL,
-                            "binary": C.file_identity(args.antfly), "host_before": C.host_snapshot()}
-    info.update(server.start(timeout_s=300))
+                            "binary": C.file_identity(args.antfly), "host_before": C.host_snapshot(),
+                            "precision": C.native_precision(args.antfly, MODEL),
+                            "weight_backing": {"format": "safetensors", "source_dtype": "BF16",
+                                               "sha256": SOURCE_WEIGHT_SHA256},
+                            "decoding": {"max_tokens": MAX_TOKENS, "prompt_override": None,
+                                         "policy": "runtime defaults; no additional sampling overrides requested",
+                                         "source_defaults": "see executable-bound lifecycle precision, when available"},
+                            "precision_environment": {
+                                key: C.public_path(value) if "/" in value else value
+                                for key, value in os.environ.items()
+                                if key.startswith(("ANTFLY_CUDA_LIGHTON", "ANTFLY_CUDA_ENABLE_LIGHTON",
+                                                   "ANTFLY_CUDA_DISABLE_LIGHTON", "ANTFLY_LIGHTONOCR3",
+                                                   "TERMITE_METAL_ENABLE_LIGHTONOCR3", "TERMITE_METAL_DISABLE_LIGHTONOCR3"))}}
+    info.update({"rows": [], "warmups": [], "repetitions": args.repetitions})
     try:
-        warm_body = antfly_body({"calls": cells[0]["calls"][:1]})
-        _, warm_ms, _ = _antfly_read(server.port, warm_body)
-        info["warmup"] = {"ms": round(warm_ms, 3), "pages": 1}
-        rows = []
-        for cell in cells:
+        info.update(server.start(timeout_s=300))
+
+        def prepare(cell):
             body = antfly_body(cell)
-            texts, elapsed_ms, details = _antfly_read(server.port, body)
-            details["batch_semantics"] = ("one HTTP read request containing four images"
-                                           if cell["id"] == "batch4_pages" else "one HTTP read request")
-            details["timing_basis"] = "complete HTTP send through response-body read; client image/base64/JSON preparation excluded"
-            rows.append({"call": _cell_row("antfly", cell, texts, elapsed_ms, lc, details),
-                         "texts": texts, "refs": [call["ref"] for call in cell["calls"]]})
-        info["rows"] = rows
-        return info
+            return lambda: _antfly_read(server.port, body)
+
+        _measure_cells(info, cells, lc, args.repetitions, prepare, lambda cell: {
+            "batch_semantics": f"one HTTP read request containing {len(cell['calls'])} image(s)",
+            "timing_basis": "complete HTTP send through response-body read; client image/base64/JSON preparation excluded"})
+    except Exception as exc:
+        _record_error(info, exc, "lifecycle")
     finally:
-        info["host_after"] = C.host_snapshot()
-        info["footprint"] = server.stop()
-        sanitize_log(out / f"{tag}.server.log")
+        _capture_stage(info, "host_after", C.host_snapshot, "host_after")
+        _capture_stage(info, "process_state",
+                       lambda: server.proc.poll() if getattr(server, "proc", None) is not None else None,
+                       "exit_code_before_teardown")
+        _capture_stage(info, "cleanup", server.stop, "footprint")
+        _capture_stage(info, "log_cleanup", lambda: sanitize_log(out / f"{tag}.server.log"))
+    return info
 
 
 def _model_dir() -> Path:
@@ -263,28 +342,107 @@ def verify_same_weights() -> dict[str, Any]:
     return {"model": MODEL, "revision": REVISION, "model_safetensors_sha256": SOURCE_WEIGHT_SHA256,
             "antfly_source_match": True, "transformers_source_match": True,
             "comparison": "SHA-256 of model.safetensors in both installed snapshots",
-            "precision_note": ("Matched source weights are BF16; the Transformers arm requests BF16 "
-                               "parameters. Native Antfly arithmetic is not instrumented by this harness.")}
+            "precision_note": ("Matched source weights are BF16. Source-derived native compute/cache facts "
+                               "and observed reference parameter/runtime settings are in lifecycle precision.")}
 
 
 def _conversation(image) -> list[dict[str, Any]]:
     return [{"role": "user", "content": [{"type": "image", "image": image}]}]
 
 
-def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
+def cache_summary(cache: Any) -> dict[str, Any]:
+    """Inspect cache metadata only: never copy or retain tensor contents."""
+    counts: dict[str, int] = {}
+    seen: set[int] = set()
+    tensors = elements = 0
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal tensors, elements
+        if value is None or id(value) in seen or depth > 5:
+            return
+        seen.add(id(value))
+        if hasattr(value, "numel") and hasattr(value, "dtype"):
+            count = int(value.numel())
+            if count:
+                tensors += 1
+                elements += count
+                key = str(value.dtype)
+                counts[key] = counts.get(key, 0) + count
+        elif isinstance(value, dict):
+            for child in value.values():
+                visit(child, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child, depth + 1)
+        elif hasattr(value, "__dict__"):
+            for child in vars(value).values():
+                visit(child, depth + 1)
+
+    visit(cache)
+    length = int(cache.get_seq_length()) if cache is not None else 0
+    return {"sequence_length": length, "populated_tensors": tensors,
+            "tensor_elements": elements, "elements_by_dtype": counts}
+
+
+def validate_cache_probe(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(steps) != 2:
+        raise RuntimeError(f"OCR cache probe expected prefill and one decode, observed {len(steps)} forwards")
+    prefill, decode = steps
+    length = prefill["after"]["sequence_length"]
+    if not (prefill["input_tokens"] > 1 and prefill["use_cache"] is True
+            and prefill["before"]["sequence_length"] == 0
+            and length == prefill["input_tokens"] and prefill["after"]["populated_tensors"] > 0
+            and decode["input_tokens"] == 1 and decode["use_cache"] is True
+            and decode["before"]["populated_tensors"] > 0
+            and decode["before"]["sequence_length"] == length
+            and decode["after"]["sequence_length"] == length + 1):
+        raise RuntimeError("OCR generation did not demonstrate populated cache reuse for one-token decode")
+    return {"validated": True, "measured": False, "forward_count": 2,
+            "prefill": prefill, "decode": decode,
+            "method": "real generate(max_new_tokens=2,min_new_tokens=2,use_cache=True), forward hooks"}
+
+
+def probe_generation_cache(model: Any, inputs: Any) -> dict[str, Any]:
+    steps: list[dict[str, Any]] = []
+
+    def before(_module: Any, _args: Any, kwargs: dict[str, Any]) -> None:
+        token_ids = kwargs.get("input_ids")
+        embeds = kwargs.get("inputs_embeds")
+        width = token_ids.shape[1] if token_ids is not None else embeds.shape[1]
+        steps.append({"input_tokens": int(width), "use_cache": kwargs.get("use_cache"),
+                      "before": cache_summary(kwargs.get("past_key_values"))})
+
+    def after(_module: Any, _args: Any, _kwargs: Any, result: Any) -> None:
+        steps[-1]["after"] = cache_summary(result.past_key_values)
+
+    pre = model.register_forward_pre_hook(before, with_kwargs=True)
+    post = model.register_forward_hook(after, with_kwargs=True)
+    try:
+        model.generate(**inputs, max_new_tokens=2, min_new_tokens=2, do_sample=False,
+                       num_beams=1, use_cache=True)
+    finally:
+        pre.remove()
+        post.remove()
+    return validate_cache_probe(steps)
+
+
+def transformers_arm(only: str | None, out: Path, lc: int, repetitions: int = 10,
+                     *, cells: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     import torch
     from PIL import Image
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
-    cells = make_cells(only, out, reuse_existing=True)
+    cells = make_cells(only, out, reuse_existing=True) if cells is None else cells
     reference = Path(C.reference_paths()[MODEL])
     device = C.ACCEL
     processor = AutoProcessor.from_pretrained(reference, local_files_only=True)
     processor.tokenizer.padding_side = "left"
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        reference, local_files_only=True, dtype=torch.bfloat16).to(device).eval()
+        reference, local_files_only=True).to(device).eval()
 
-    def infer(calls: list[dict[str, Any]], max_tokens: int = MAX_TOKENS) -> list[str]:
+    cache_probe: dict[str, Any] = {}
+
+    def infer(calls: list[dict[str, Any]], max_tokens: int = MAX_TOKENS, *, probe: bool = False) -> list[str]:
         images = []
         try:
             for call in calls:
@@ -296,6 +454,9 @@ def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
                 return_dict=True, return_tensors="pt", padding=len(conversations) > 1,
                 enable_thinking=False).to(device)
             with torch.inference_mode():
+                if probe:
+                    cache_probe.update(probe_generation_cache(model, inputs))
+                    return []
                 generated = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False,
                                            num_beams=1, use_cache=True)
             prompt_width = inputs["input_ids"].shape[1]
@@ -305,29 +466,41 @@ def transformers_arm(only: str | None, out: Path, lc: int) -> dict[str, Any]:
             for image in images:
                 image.close()
 
-    infer(cells[0]["calls"][:1])
-    sync = C.torch_sync(torch)
-    rows = []
-    for cell in cells:
-        sync()
-        started = time.perf_counter()
-        texts = infer(cell["calls"])
-        sync()
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        semantics = ("one batched processor/generate call containing four pages"
-                     if cell["id"] == "batch4_pages" else "one processor/generate call")
-        rows.append({"call": _cell_row("transformers", cell, texts, elapsed_ms, lc,
-                                       {"batch_semantics": semantics,
-                                        "timing_basis": "processor image preparation, model inference, and decode"}),
-                     "texts": texts, "refs": [call["ref"] for call in cell["calls"]]})
-    versions = {package: importlib.metadata.version(package) for package in ("torch", "transformers", "pillow")}
-    return {"provider": "transformers", "arm": "transformers", "model": MODEL,
-            "versions": versions, "requested_dtype": "bfloat16",
-            "parameter_dtype": str(next(model.parameters()).dtype), "device": device,
+    info = {"provider": "transformers", "arm": "transformers", "model": MODEL,
+            "requested_dtype": None, "device": device, "rows": [],
+            "cache_probe": cache_probe, "warmups": [], "repetitions": repetitions,
             "api": "AutoProcessor.apply_chat_template + Qwen3_5ForConditionalGeneration.generate",
             "decoding": {"prompt": "", "enable_thinking": False, "max_new_tokens": MAX_TOKENS,
-                         "do_sample": False, "num_beams": 1, "padding_side": "left", "use_cache": True},
-            "device_memory": C.torch_device_bytes(torch), "rows": rows}
+                         "do_sample": False, "num_beams": 1, "padding_side": "left", "use_cache": True}}
+    try:
+        infer(cells[0]["calls"][:1], max_tokens=1, probe=True)
+        sync = C.torch_sync(torch)
+
+        def prepare(cell):
+            def measured():
+                sync()
+                started = time.perf_counter()
+                texts = infer(cell["calls"])
+                sync()
+                return texts, (time.perf_counter() - started) * 1000, {}
+            return measured
+
+        _measure_cells(info, cells, lc, repetitions, prepare, lambda cell: {
+            "batch_semantics": f"one batched processor/generate call containing {len(cell['calls'])} page(s)",
+            "timing_basis": "processor image preparation, model inference, and decode"})
+    except Exception as exc:
+        _record_error(info, exc, "cache_probe" if not cache_probe else "measurement")
+    _capture_stage(info, "precision", lambda: C.reference_precision(
+        model, default_policy="library_default"), "precision")
+    _capture_stage(info, "versions", lambda: {
+        package: importlib.metadata.version(package) for package in ("torch", "transformers", "pillow")}, "versions")
+    _capture_stage(info, "generation_config", lambda: info["decoding"].update({
+        "generation_config": {key: getattr(model.generation_config, key, None)
+            for key in ("eos_token_id", "pad_token_id", "bos_token_id", "repetition_penalty",
+                        "no_repeat_ngram_size", "length_penalty", "forced_bos_token_id",
+                        "forced_eos_token_id", "suppress_tokens", "begin_suppress_tokens")}}))
+    _capture_stage(info, "device_memory", lambda: C.torch_device_bytes(torch), "device_memory")
+    return info
 
 
 def pyarm_main(argv: list[str]) -> int:
@@ -336,10 +509,13 @@ def pyarm_main(argv: list[str]) -> int:
     parser.add_argument("--only-cell", choices=CELLS)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--lc", type=int, required=True)
+    parser.add_argument("--repetitions", type=int, default=10)
     args = parser.parse_args(argv)
     C.configure_backend(args.backend)
     try:
-        result = transformers_arm(args.only_cell, args.out, args.lc)
+        if args.repetitions < 1:
+            raise ValueError("--repetitions must be positive")
+        result = transformers_arm(args.only_cell, args.out, args.lc, args.repetitions)
     except Exception as exc:
         result = {"provider": "transformers", "arm": "transformers", "model": MODEL,
                   "error": public_error(exc)}
@@ -350,28 +526,34 @@ def pyarm_main(argv: list[str]) -> int:
 def agreement_rows(lc: int, cells: list[dict[str, Any]], results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     output = []
     for cell in cells:
-        by_arm: dict[str, list[str]] = {}
-        for arm in PROVIDERS:
-            match = next((row for row in (results.get(arm) or {}).get("rows", [])
-                          if row["call"]["cell"] == cell["id"]), None)
-            if match is not None:
-                by_arm[arm] = match["texts"]
-        row: dict[str, Any] = {"workload": WORKLOAD, "model": MODEL, "lc": lc,
-                               "cell": cell["id"], "providers": list(by_arm),
-                               "complete": len(by_arm) == len(PROVIDERS)}
-        if row["complete"]:
-            left = [normalize_characters(text) for text in by_arm["antfly"]]
-            right = [normalize_characters(text) for text in by_arm["transformers"]]
-            if len(left) != len(right):
-                raise ValueError("paired OCR output counts differ")
-            exact = [a == b for a, b in zip(left, right, strict=True)]
-            edits = sum(edit_distance(a, b) for a, b in zip(left, right, strict=True))
-            chars = sum(len(value) for value in right)
-            row.update({"normalized_exact_count": sum(exact), "items": len(exact),
-                        "all_normalized_exact": all(exact), "character_edits": edits,
-                        "character_error_rate": edits / max(1, chars),
-                        "character_agreement": max(0.0, 1.0 - edits / max(1, chars))})
-        output.append(row)
+        repetitions = sorted({row["call"].get("repetition", 0)
+                              for result in results.values() for row in result.get("rows", [])
+                              if row["call"]["cell"] == cell["id"]}) or [0]
+        for repetition in repetitions:
+            by_arm: dict[str, list[str]] = {}
+            for arm in PROVIDERS:
+                match = next((row for row in (results.get(arm) or {}).get("rows", [])
+                              if row["call"]["cell"] == cell["id"]
+                              and row["call"].get("repetition", 0) == repetition
+                              and row["call"].get("ok", True)), None)
+                if match is not None:
+                    by_arm[arm] = match["texts"]
+            row: dict[str, Any] = {"workload": WORKLOAD, "model": MODEL, "lc": lc,
+                                   "cell": cell["id"], "repetition": repetition, "providers": list(by_arm),
+                                   "complete": len(by_arm) == len(PROVIDERS)}
+            if row["complete"]:
+                left = [normalize_characters(text) for text in by_arm["antfly"]]
+                right = [normalize_characters(text) for text in by_arm["transformers"]]
+                if len(left) != len(right):
+                    raise ValueError("paired OCR output counts differ")
+                exact = [a == b for a, b in zip(left, right, strict=True)]
+                edits = sum(edit_distance(a, b) for a, b in zip(left, right, strict=True))
+                chars = sum(len(value) for value in right)
+                row.update({"normalized_exact_count": sum(exact), "items": len(exact),
+                            "all_normalized_exact": all(exact), "character_edits": edits,
+                            "character_error_rate": edits / max(1, chars),
+                            "character_agreement": max(0.0, 1.0 - edits / max(1, chars))})
+            output.append(row)
     return output
 
 
@@ -383,7 +565,8 @@ def _write_arm(out: Path, result: dict[str, Any], lc: int) -> None:
             calls.write(row["call"])
             for index, text in enumerate(row["texts"]):
                 outputs.write({"workload": WORKLOAD, "model": MODEL, "provider": result["provider"],
-                               "arm": result["arm"], "lc": lc, "cell": row["call"]["cell"], "k": index,
+                               "arm": result["arm"], "lc": lc, "cell": row["call"]["cell"],
+                               "repetition": row["call"].get("repetition", 0), "k": index,
                                "text": text, "ref": row["refs"][index]})
     finally:
         calls.close()
@@ -416,18 +599,18 @@ def orchestrate(args: argparse.Namespace) -> int:
                     if arm == "antfly":
                         result = run_antfly(args, cells, out, lc)
                     else:
-                        child_args = ["--backend", args.backend, "--out", str(out), "--lc", str(lc)]
+                        child_args = ["--backend", args.backend, "--out", str(out), "--lc", str(lc),
+                                      "--repetitions", str(args.repetitions)]
                         if args.only_cell:
                             child_args.extend(["--only-cell", args.only_cell])
                         result = C.run_python_arm(str(Path(__file__)), child_args, out, f"lc{lc}-transformers")
-                        sanitize_log(out / f"lc{lc}-transformers.py.log")
-                    if result.get("rc", 0) != 0 or "error" in result:
-                        failed = True
-                    else:
-                        _write_arm(out, result, lc)
+                        _capture_stage(result, "log_cleanup", lambda: sanitize_log(out / f"lc{lc}-transformers.py.log"))
                 except Exception as exc:
                     failed = True
                     result = {"provider": arm, "arm": arm, "model": MODEL, "error": public_error(exc)}
+                if result.get("rc", 0) != 0 or "error" in result:
+                    failed = True
+                _write_arm(out, result, lc)
                 results[arm] = result
                 lifecycle = {key: value for key, value in result.items() if key != "rows"}
                 lifecycle.update({"workload": WORKLOAD, "model": MODEL, "provider": arm, "lc": lc,
@@ -439,7 +622,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     finally:
         lifecycle_writer.close()
         agreement_writer.close()
-    complete = C.benchmark_complete(out, set(PROVIDERS), args.lifecycles, len(cells))
+    complete = C.benchmark_complete(out, set(PROVIDERS), args.lifecycles, len(cells) * args.repetitions)
     return 1 if failed or not complete else 0
 
 
@@ -455,9 +638,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--lifecycles", type=int, default=3)
     run.add_argument("--out", type=Path, required=True)
     run.add_argument("--only-cell", choices=CELLS)
+    run.add_argument("--repetitions", type=int, default=10)
     args = parser.parse_args(argv)
-    if args.lifecycles < 1:
-        parser.error("--lifecycles must be positive")
+    if args.lifecycles < 1 or args.repetitions < 1:
+        parser.error("--lifecycles and --repetitions must be positive")
     return orchestrate(args)
 
 

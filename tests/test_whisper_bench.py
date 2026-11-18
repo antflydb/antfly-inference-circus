@@ -64,16 +64,6 @@ class WhisperBenchTests(unittest.TestCase):
                     whisper.main(argv)
                 self.assertEqual(raised.exception.code, 2)
 
-    def test_cpp_native_timing_requires_valid_load_and_total_fields(self) -> None:
-        parsed = whisper._parse_cpp_timings(
-            "whisper_print_timings: load time = 125.25 ms\n"
-            "whisper_print_timings: total time = 900.50 ms\n")
-        self.assertEqual(whisper._cpp_compute_ms(parsed), 775.25)
-        with self.assertRaises(ValueError):
-            whisper._cpp_compute_ms({"total_time": 900.5})
-        with self.assertRaises(ValueError):
-            whisper._cpp_compute_ms({"load_time": 900.5, "total_time": 900.5})
-
     def test_cpp_provenance_is_bound_to_source_and_converted_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -85,7 +75,7 @@ class WhisperBenchTests(unittest.TestCase):
                      "source_revision": whisper.REVISION,
                      "source_model_sha256": whisper.SOURCE_WEIGHT_SHA256,
                      "converted_model_sha256": converted_sha,
-                     "converter": {"name": "whisper.cpp", "revision": "a" * 40},
+                     "converter": {"name": "whisper.cpp", "revision": whisper.CPP_REVISION},
                      "private_path": "/must/not/be-published"}
             provenance.write_text(json.dumps(value))
             public = whisper.validate_cpp_provenance(model, provenance)

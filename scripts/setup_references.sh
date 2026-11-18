@@ -143,6 +143,11 @@ PY
     -DGGML_METAL=OFF
     "-DCUDAToolkit_ROOT=$CUDA_ROOT"
     "-DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc"
+    # NVIDIA's pip wheels expose versioned SONAMEs without development symlinks.
+    "-DCUDA_CUDART=$CUDA_LIB/libcudart.so.13"
+    "-DCUDA_cudart_LIBRARY=$CUDA_LIB/libcudart.so.13"
+    "-DCUDA_cublas_LIBRARY=$CUDA_LIB/libcublas.so.13"
+    "-DCUDA_cublasLt_LIBRARY=$CUDA_LIB/libcublasLt.so.13"
     "-DCMAKE_CUDA_ARCHITECTURES=${TERMITE_CUDA_ARCHITECTURES:-native}"
     "-DCMAKE_BUILD_RPATH=$CUDA_LIB"
   )
@@ -163,11 +168,11 @@ cmake --build "$LLAMA_BUILD" --config Release --target llama-server --parallel "
 cmake -S "$WHISPER_DIR" -B "$WHISPER_BUILD" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
   "${CMAKE_ACCEL[@]}"
-cmake --build "$WHISPER_BUILD" --config Release --target whisper-cli --parallel "$BUILD_JOBS"
+cmake --build "$WHISPER_BUILD" --config Release --target whisper-server --parallel "$BUILD_JOBS"
 
 mkdir -p "$BIN_DIR"
 ln -sfn "$LLAMA_BUILD/bin/llama-server" "$BIN_DIR/llama-server"
-ln -sfn "$WHISPER_BUILD/bin/whisper-cli" "$BIN_DIR/whisper-cli"
+ln -sfn "$WHISPER_BUILD/bin/whisper-server" "$BIN_DIR/whisper-server"
 
 if ((CONVERT_WHISPER)); then
   OPENAI_WHISPER_DIR=$NATIVE_ROOT/openai-whisper
@@ -289,7 +294,7 @@ fi
 
 printf 'reference Python: %s\n' "$PY"
 printf 'llama-server: %s\n' "$BIN_DIR/llama-server"
-printf 'whisper-cli: %s\n' "$BIN_DIR/whisper-cli"
+printf 'whisper-server: %s\n' "$BIN_DIR/whisper-server"
 if ((CONVERT_WHISPER)); then
   printf 'whisper.cpp model: %s\n' "$CONVERTED_MODEL"
   printf 'whisper.cpp provenance: %s\n' "$PROVENANCE"

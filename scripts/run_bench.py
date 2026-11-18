@@ -18,7 +18,7 @@ import common as C  # noqa: E402
 import fetch_reference  # noqa: E402
 import summarize  # noqa: E402
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_RECORD_BYTES = 1 << 20
 WORKLOAD_GROUPS = {
     "embed": ["embed"],
@@ -32,7 +32,7 @@ PULLS = {
     "gliner-base": ("fastino/gliner2.5-base-v1:safetensors", []),
     "gliner-decide": ("fastino/GLiNER2.5-Decide:safetensors", []),
     "gemma4": ("google/gemma-4-E4B-it-qat-q4_0-gguf:gguf", []),
-    "whisper": ("openai/whisper-small:safetensors", []),
+    "whisper": ("openai/whisper-small:safetensors", ["--tasks", "transcribe"]),
     "ocr": ("lightonai/LightOnOCR-3-0.8B:safetensors", []),
 }
 REFERENCE_MODULES = {
@@ -43,6 +43,8 @@ REFERENCE_MODULES = {
     "whisper": {"torch", "transformers", "numpy", "huggingface_hub", "psutil"},
     "ocr": {"torch", "transformers", "PIL", "huggingface_hub", "psutil"},
 }
+QUALITY_SCRIPTS = {key: f"quality_{key}.py" for key in ("embed", "gemma", "whisper", "ocr")}
+QUALITY_SCRIPTS["gemma4"] = QUALITY_SCRIPTS.pop("gemma")
 
 
 class RunnerError(RuntimeError):
@@ -111,7 +113,7 @@ def validate_selection(keys: list[str], only_cell: str | None, lifecycles: int) 
 
 
 def fresh_output(output: Path) -> None:
-    protected = ("result.json", "provenance.json", "inputs.provenance.json", "terminal.json", "speed", "memory")
+    protected = ("result.json", "provenance.json", "inputs.provenance.json", "terminal.json", "speed", "memory", "quality")
     stale = [name for name in protected if (output / name).exists()]
     if stale:
         raise RunnerError(f"output already contains benchmark records: {', '.join(stale)}")
@@ -214,6 +216,14 @@ def setup_assets(keys: list[str], binary: Path, env: dict[str, str], output: Pat
                 **({} if returncode == 0 else {"error": f"media fetch exited {returncode}"}),
             }
         )
+    for key in keys:
+        if key not in QUALITY_SCRIPTS:
+            continue
+        command = [str(C.REF_PY), str(C.ROOT / "scripts" / QUALITY_SCRIPTS[key]), "setup"]
+        rc = run_logged(command, output / "execution" / f"setup-quality-{key}.txt", env)
+        steps.append({"workload": summarize.WORKLOADS[key]["workload"], "model": summarize.WORKLOADS[key]["model"],
+                      "provider": "public quality fixtures", "phase": "setup", "status": "complete" if rc == 0 else "failed",
+                      **({"error": f"quality fixture setup exited {rc}"} if rc else {})})
     return steps
 
 
@@ -272,7 +282,7 @@ def import_script(name: str):
     return module
 
 
-def preflight(keys: list[str], binary: Path, backend: str) -> dict[str, Any]:
+def preflight(keys: list[str], binary: Path, backend: str, phases: set[str] | None = None) -> dict[str, Any]:
     C.configure_backend(backend)
     for key in keys:
         script = C.ROOT / "scripts" / summarize.WORKLOADS[key]["script"]
@@ -305,7 +315,7 @@ def preflight(keys: list[str], binary: Path, backend: str) -> dict[str, Any]:
         llama_path = Path(llama_resolved)
         assets["llama_server"] = {
             **C.file_identity(llama_path),
-            "version": command_version(llama_path),
+            "version_source": "running server GET /props.build_info (lifecycle metadata)",
         }
     if "whisper" in keys:
         whisper = import_script("whisper_bench.py")
@@ -318,6 +328,13 @@ def preflight(keys: list[str], binary: Path, backend: str) -> dict[str, Any]:
     if "ocr" in keys:
         ocr = import_script("ocr_bench.py")
         assets["ocr_files"] = ocr.verify_same_weights()
+    for key in keys:
+        if key in QUALITY_SCRIPTS and (phases is None or "quality" in phases or key == "whisper"):
+            process = subprocess.run([str(C.REF_PY), str(C.ROOT / "scripts" / QUALITY_SCRIPTS[key]), "check"],
+                                     capture_output=True, text=True, check=False)
+            if process.returncode:
+                raise RunnerError(f"{key} quality fixtures missing or mismatched; run --phase setup")
+            assets[f"quality_{key}"] = json.loads(process.stdout.strip().splitlines()[-1])
     assets["binary"] = {**C.file_identity(binary), "version": command_version(binary)}
     return assets
 
@@ -329,6 +346,7 @@ def workload_command(
     lifecycles: int,
     out: Path,
     only_cell: str | None,
+    repetitions: int = 10,
 ) -> list[str]:
     spec = summarize.WORKLOADS[key]
     command = [
@@ -347,42 +365,42 @@ def workload_command(
     ]
     if only_cell:
         command.extend(["--only-cell", only_cell])
+    if spec["workload"] in {"whisper", "ocr"}:
+        command.extend(["--repetitions", str(repetitions)])
     return command
 
 
-def run_measurements(
-    root: Path,
-    keys: list[str],
-    phases: set[str],
-    binary: Path,
-    backend: str,
-    lifecycles: int,
-    only_cell: str | None,
-    env: dict[str, str],
-) -> dict[tuple[str, str], int]:
+def run_measurements(root: Path, keys: list[str], phases: set[str], binary: Path, backend: str,
+                     lifecycles: int, only_cell: str | None, env: dict[str, str],
+                     memory_lifecycles: int = 3, repetitions: int = 10) -> dict[tuple[str, str, str], int]:
     failures = {}
-    if "speed" in phases:
-        for key in keys:
-            out = root / "speed" / key
-            command = workload_command(key, binary, backend, lifecycles, out, only_cell)
-            rc = run_logged(command, root / "execution" / f"speed-{key}.txt", env)
+    for key in keys:
+        if "speed" in phases or ("quality" in phases and key.startswith("gliner-")):
+            command = workload_command(key, binary, backend, lifecycles, root / "speed" / key, only_cell, repetitions)
+            rc = run_logged(command, root / "execution" / f"speed-{key}.txt", {**env, "TERMITE_SAMPLE_MEMORY": "0"})
             if rc:
-                failures[(summarize.WORKLOADS[key]["model"], "speed")] = rc
-    if "memory" in phases:
-        for key in keys:
-            cells = summarize.selected_cells(summarize.WORKLOADS[key], only_cell)
-            for cell in cells:
-                out = root / "memory" / key / cell
-                command = workload_command(key, binary, backend, 1, out, cell)
-                rc = run_logged(command, root / "execution" / f"memory-{key}-{cell}.txt", env)
+                failures[(summarize.WORKLOADS[key]["model"], "speed", only_cell or "all")] = rc
+        if "memory" in phases:
+            for cell in summarize.selected_cells(summarize.WORKLOADS[key], only_cell, repetitions):
+                command = workload_command(key, binary, backend, memory_lifecycles, root / "memory" / key / cell, cell, repetitions)
+                rc = run_logged(command, root / "execution" / f"memory-{key}-{cell}.txt", {**env, "TERMITE_SAMPLE_MEMORY": "1"})
                 if rc:
-                    failures[(summarize.WORKLOADS[key]["model"], "memory")] = rc
+                    failures[(summarize.WORKLOADS[key]["model"], "memory", cell)] = rc
+        if "quality" in phases:
+            if key.startswith("gliner-"):
+                summarize.write_gliner_quality(root, key, lifecycles, only_cell)
+            else:
+                command = [str(C.REF_PY), str(C.ROOT / "scripts" / QUALITY_SCRIPTS[key]), "run",
+                           "--antfly", str(binary), "--backend", backend, "--out", str(root / "quality" / key)]
+                rc = run_logged(command, root / "execution" / f"quality-{key}.txt", {**env, "TERMITE_SAMPLE_MEMORY": "0"})
+                if rc:
+                    failures[(summarize.WORKLOADS[key]["model"], "quality", "all")] = rc
     return failures
 
 
 def failure_steps(keys: list[str], phases: set[str], error: str) -> list[dict]:
     steps = []
-    measured = phases & {"speed", "memory"}
+    measured = phases & {"speed", "memory", "quality"}
     if not measured:
         measured = {"check"}
     for key in keys:
@@ -425,8 +443,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--models-dir", type=Path, default=Path(os.environ.get("TERMITE_MODELS_DIR", C.MODELS_DIR)))
     result.add_argument("--workload", action="append", choices=sorted(WORKLOAD_GROUPS))
     result.add_argument("--model", action="append")
-    result.add_argument("--phase", action="append", choices=("setup", "speed", "memory"))
+    result.add_argument("--phase", action="append", choices=("setup", "speed", "memory", "quality"))
     result.add_argument("--lifecycles", type=int, default=3)
+    result.add_argument("--memory-lifecycles", type=int, default=3)
+    result.add_argument("--repetitions", type=int, default=10)
     result.add_argument("--only-cell")
     result.add_argument("--run-id")
     result.add_argument("--check", action="store_true")
@@ -437,7 +457,7 @@ def main() -> int:
     args = parser().parse_args()
     started_at = C.utc_now()
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    phases = {"check"} if args.check else set(args.phase or ["speed", "memory"])
+    phases = {"check"} if args.check else set(args.phase or ["speed", "memory", "quality"])
     output = (args.output or Path(os.environ.get("TERMITE_OUTPUT", C.RESULTS / run_id))).expanduser().resolve()
     try:
         fresh_output(output)
@@ -451,9 +471,12 @@ def main() -> int:
     comparisons: list[dict] = []
     assets: dict[str, Any] = {}
     exit_code = 1
+    execution_failures = {}
     try:
         keys = selected_keys(args.workload, args.model)
         validate_selection(keys, args.only_cell, args.lifecycles)
+        if args.memory_lifecycles < 1 or args.repetitions < 1:
+            raise RunnerError("memory lifecycles and repetitions must be positive")
         binary = resolve_binary(args.binary)
         backend = C.configure_backend(args.backend)
         C.MODELS_DIR = args.models_dir.expanduser().resolve()
@@ -471,7 +494,7 @@ def main() -> int:
             steps.extend(setup_steps)
             if any(step["status"] != "complete" for step in setup_steps):
                 raise RunnerError("one or more setup steps failed")
-        assets = preflight(keys, binary, backend)
+        assets = preflight(keys, binary, backend, phases)
         if args.check:
             steps = [
                 {
@@ -485,39 +508,37 @@ def main() -> int:
                 for provider in summarize.WORKLOADS[key]["arms"].values()
             ]
         else:
-            measured = phases & {"speed", "memory"}
-            execution_failures = run_measurements(output, keys, measured, binary, backend, args.lifecycles, args.only_cell, env)
+            measured = phases & {"speed", "memory", "quality"}
+            execution_failures = run_measurements(output, keys, measured, binary, backend, args.lifecycles, args.only_cell, env,
+                                                   args.memory_lifecycles, args.repetitions)
             if measured:
-                summary = summarize.build_summary(output, keys, measured, args.lifecycles, args.only_cell)
-                for step in summary["steps"]:
-                    rc = execution_failures.get((step["model"], step["phase"]))
-                    if rc:
-                        step["status"] = "failed"
-                        step.pop("metrics", None)
-                        step["error"] = f"workload process exited {rc}"
+                summary = summarize.build_summary(output, keys, measured, args.lifecycles, args.only_cell,
+                                                  args.memory_lifecycles, args.repetitions)
                 steps.extend(summary["steps"])
-                comparisons.extend(
-                    row for row in summary["comparisons"]
-                    if (row["model"], row.get("phase", "speed")) not in execution_failures
-                )
-                if execution_failures or summary["status"] != "complete":
-                    raise RunnerError("one or more measured provider steps failed")
+                comparisons.extend(summary["comparisons"])
+                unexpected = execution_failures or any(
+                    cell.get("status") == "failed" for step in steps for cell in step.get("cells", {}).values()
+                ) or any(step["status"] == "failed" for step in steps)
+                if unexpected:
+                    error = "one or more provider/cell executions failed; completed sibling evidence retained"
         exit_code = 0
     except Exception as exc:
         error = C.public_error(exc)
         if not any(step.get("status") == "failed" for step in steps):
             steps.extend(failure_steps(keys, phases, error) if keys else [])
     completed_at = C.utc_now()
-    complete = exit_code == 0 and bool(steps) and all(step.get("status") == "complete" for step in steps)
-    if not complete:
-        exit_code = 1
-    status = "complete" if complete else "failed"
+    status = summarize.aggregate_status(step["status"] for step in steps)
+    if error:
+        status = "partial" if any(step.get("metrics") for step in steps) else "failed"
+    exit_code = 1 if error or status == "failed" else 0
     binary_record = C.file_identity(binary) | {"version": command_version(binary)} if binary and binary.is_file() else None
     selection = {
         "workloads": [summarize.WORKLOADS[key]["workload"] for key in keys],
         "models": [summarize.WORKLOADS[key]["model"] for key in keys],
         "phases": sorted(phases),
         "lifecycles": args.lifecycles,
+        "memory_lifecycles": args.memory_lifecycles,
+        "independent_repetitions_per_audio_or_ocr_cell": args.repetitions,
         "cell": args.only_cell,
         "backend": C.ANTFLY_BACKEND,
     }
@@ -531,6 +552,8 @@ def main() -> int:
             "backend": C.ANTFLY_BACKEND,
             "steps": steps,
             "comparisons": comparisons,
+            "execution_errors": [{"model": model, "phase": phase, "cell": cell, "exit_code": rc}
+                                 for (model, phase, cell), rc in execution_failures.items()],
             **({"error": error} if error else {}),
         },
         "provenance.json": {
@@ -542,7 +565,8 @@ def main() -> int:
             "subject": binary_record,
             "runner": C.file_identity(Path(__file__)),
             "protocol_sources": [
-                C.file_identity(path) for path in sorted((C.ROOT / "scripts").glob("*.py"))
+                C.file_identity(path) for path in sorted(path for path in (C.ROOT / "scripts").iterdir()
+                                                       if path.suffix in {".py", ".sh", ".json"})
             ],
             "backend": C.ANTFLY_BACKEND,
             "platform": {"system": platform.system(), "architecture": platform.machine()},
@@ -569,6 +593,9 @@ def main() -> int:
     }
     try:
         write_records(output, records)
+        checksums = {str(path.relative_to(output)): C.sha256_file(path) for path in sorted(output.rglob("*.json"))
+                     if path.name != "receipt.json"}
+        write_records(output, {"receipt.json": {"schema_version": SCHEMA_VERSION, "algorithm": "sha256", "files": checksums}})
     except RunnerError as exc:
         print(f"error: {C.public_error(exc)}", file=sys.stderr)
         return 1
